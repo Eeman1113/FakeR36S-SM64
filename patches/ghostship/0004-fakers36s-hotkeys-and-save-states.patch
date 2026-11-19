@@ -1,0 +1,953 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1f4c038..daaf568 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -754,6 +754,17 @@ list(APPEND ADDITIONAL_LIBRARY_DEPENDENCIES torch)
+ endif()
+ 
+ target_link_libraries(${PROJECT_NAME} PRIVATE "${ADDITIONAL_LIBRARY_DEPENDENCIES}")
++
++# FakeR36S: handheld hotkeys and save states (src/port/FrSaveStates.cpp). The game's variables in one range
++# (fakers36s-state.ld) and the executable's own allocations recorded while an asset is built (--wrap), so a state
++# written to the card can be read back after a restart (with -no-pie: the same addresses on every run).
++option(FAKER36S "FakeR36S-OS: hotkeys and save states" OFF)
++if(FAKER36S)
++    target_compile_definitions(${PROJECT_NAME} PRIVATE FAKER36S=1)
++    target_link_options(${PROJECT_NAME} PRIVATE "-Wl,-T,${CMAKE_CURRENT_SOURCE_DIR}/fakers36s-state.ld"
++        "-Wl,--wrap=malloc,--wrap=calloc,--wrap=realloc,--wrap=free")
++    set_property(TARGET ${PROJECT_NAME} APPEND PROPERTY LINK_DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/fakers36s-state.ld")
++endif()
+ ################################################################################
+ # Compile and link options
+ ################################################################################
+diff --git a/fakers36s-state.ld b/fakers36s-state.ld
+new file mode 100644
+index 0000000..a0c7d35
+--- /dev/null
++++ b/fakers36s-state.ld
+@@ -0,0 +1,27 @@
++/* FakeR36S: the game's own variables (every C file of Ghostship: the SM64 decompilation's data and bss, the audio
++   heap, the object lists...) gathered into one range each, so a save state is two memcpys plus the used parts of
++   the main pool. Inserted BEFORE .data and .bss so these patterns see the game's objects first; read-only data
++   (.data.rel.ro, made read-only after relocation) stays where it was. */
++SECTIONS
++{
++  .fr_state_data : ALIGN(64)
++  {
++    __fr_data_start = .;
++    *Ghostship.dir/*.c.o(.data .data.rel .data.rel.local)
++    . = ALIGN(64);
++    __fr_data_end = .;
++  }
++}
++INSERT BEFORE .data;
++
++SECTIONS
++{
++  .fr_state_bss : ALIGN(64)
++  {
++    __fr_bss_start = .;
++    *Ghostship.dir/*.c.o(.bss .bss.* COMMON)
++    . = ALIGN(64);
++    __fr_bss_end = .;
++  }
++}
++INSERT BEFORE .bss;
+diff --git a/src/port/FrSaveStates.cpp b/src/port/FrSaveStates.cpp
+new file mode 100644
+index 0000000..112c4e9
+--- /dev/null
++++ b/src/port/FrSaveStates.cpp
+@@ -0,0 +1,860 @@
++// FakeR36S-SM64: the handheld's hotkeys and save states, kept on the card.
++//   Select + Start   quit (the autosave is written first)     Select + B      show / hide the stats window (FPS)
++//   Select + R1      save to the current slot                  Select + L1     load the current slot
++//   Select + Right   next slot (0 to 5)                        Select + Left   previous slot
++//   Select + X       load the autosave (the first one after a restart resumes the last session)
++// The game sees none of its buttons while Select is held. The autosave is refreshed every gFakeR36S.Autosave
++// seconds (5, 0 = off) in memory and written to the card every gFakeR36S.DiskAutosave seconds (30).
++//
++// A state is a copy of the game's memory: every variable of Ghostship's C files (SM64's own globals, the audio heap,
++// the object lists), gathered by fakers36s-state.ld into one data and one bss range, plus the used parts of the main
++// pool (a static array). Restoring one is a memcpy back, between two frames. The executable is non-PIE, so all of
++// that, and every pointer into it, is at the same address on every run. Only pointers into assets loaded from the
++// .o2r move between runs: libultraship (patches/lus/0003) wraps the building of every asset in FrTrack_Push/Pop, and
++// the global operator new and the wrapped malloc below record each block allocated meanwhile as (asset path, block
++// number). Loading the same asset again allocates the same blocks in the same order, so such a pointer is written
++// to the card as (asset, block, offset) and rebuilt in any later run. From FakeR36S-Ocarina's soh patch 0005,
++// docs/persistent-savestates.md there.
++#ifdef FAKER36S
++
++#include <SDL2/SDL.h>
++#include <spdlog/spdlog.h>
++
++#include <algorithm>
++#include <atomic>
++#include <condition_variable>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <deque>
++#include <filesystem>
++#include <map>
++#include <memory>
++#include <mutex>
++#include <new>
++#include <string>
++#include <thread>
++#include <vector>
++#include <unistd.h>
++
++#include <libultraship/bridge/consolevariablebridge.h>
++#include <ship/Context.h>
++#include <ship/window/Window.h>
++#include <ship/window/gui/Gui.h>
++#include <ship/window/gui/GameOverlay.h>
++#include <ship/controller/controldeck/ControlDeck.h>
++#include <ship/resource/ResourceManager.h>
++#include "ShipCompat.h"
++
++extern "C" {
++extern char __fr_data_start[], __fr_data_end[], __fr_bss_start[], __fr_bss_end[];
++extern uint8_t* sPoolStart;
++extern uint8_t* sPoolEnd;
++extern void* sPoolListHeadL;
++extern void* sPoolListHeadR;
++void gfx_texture_cache_clear();
++void* __real_malloc(size_t);
++void* __real_calloc(size_t, size_t);
++void* __real_realloc(void*, size_t);
++void __real_free(void*);
++}
++
++// ================================================================================================
++// Asset block tracking
++// ================================================================================================
++namespace frtrack {
++template <class T> struct MallocAlloc {
++    using value_type = T;
++    MallocAlloc() = default;
++    template <class U> MallocAlloc(const MallocAlloc<U>&) {
++    }
++    T* allocate(size_t n) {
++        void* p = __real_malloc(n * sizeof(T));
++        if (p == nullptr) throw std::bad_alloc();
++        return static_cast<T*>(p);
++    }
++    void deallocate(T* p, size_t) {
++        __real_free(p);
++    }
++    template <class U> bool operator==(const MallocAlloc<U>&) const {
++        return true;
++    }
++    template <class U> bool operator!=(const MallocAlloc<U>&) const {
++        return false;
++    }
++};
++
++struct Block {
++    uint32_t path, idx, size;
++};
++struct StrLess {
++    bool operator()(const char* a, const char* b) const {
++        return strcmp(a, b) < 0;
++    }
++};
++using BlockMap = std::map<uintptr_t, Block, std::less<uintptr_t>, MallocAlloc<std::pair<const uintptr_t, Block>>>;
++using KeyMap = std::map<uint64_t, uintptr_t, std::less<uint64_t>, MallocAlloc<std::pair<const uint64_t, uintptr_t>>>;
++using PathIndex = std::map<const char*, uint32_t, StrLess, MallocAlloc<std::pair<const char* const, uint32_t>>>;
++using PathVec = std::vector<char*, MallocAlloc<char*>>;
++
++// never destroyed: the tracker must outlive every static destructor that frees memory
++static std::mutex& Mu() {
++    static std::mutex* m = new (__real_malloc(sizeof(std::mutex))) std::mutex();
++    return *m;
++}
++static BlockMap& Blocks() {
++    static BlockMap* m = new (__real_malloc(sizeof(BlockMap))) BlockMap();
++    return *m;
++}
++static KeyMap& Keys() {
++    static KeyMap* m = new (__real_malloc(sizeof(KeyMap))) KeyMap();
++    return *m;
++}
++static PathIndex& Index() {
++    static PathIndex* m = new (__real_malloc(sizeof(PathIndex))) PathIndex();
++    return *m;
++}
++static PathVec& Paths() {
++    static PathVec* m = new (__real_malloc(sizeof(PathVec))) PathVec();
++    return *m;
++}
++
++struct Frame {
++    uint32_t path, next;
++};
++static const int kMaxDepth = 32;
++static thread_local Frame tStack[kMaxDepth];
++static thread_local int tDepth = 0;
++static thread_local bool tInside = false; // the tracker's own allocations are never recorded
++static std::atomic<uint32_t> gCount{ 0 };
++static std::atomic<uintptr_t> gLo{ UINTPTR_MAX }, gHi{ 0 };
++
++static uint64_t Key(uint32_t path, uint32_t idx) {
++    return ((uint64_t)path << 32) | idx;
++}
++
++// with Mu() held
++static uint32_t Intern(const char* path) {
++    auto it = Index().find(path);
++    if (it != Index().end()) return it->second;
++    const size_t n = strlen(path) + 1;
++    char* copy = static_cast<char*>(__real_malloc(n));
++    memcpy(copy, path, n);
++    uint32_t id = (uint32_t)Paths().size();
++    Paths().push_back(copy);
++    Index()[copy] = id;
++    return id;
++}
++
++static void OnAlloc(void* p, size_t n) {
++    if (p == nullptr || tDepth == 0 || tDepth > kMaxDepth || tInside) return;
++    Frame& f = tStack[tDepth - 1];
++    const uintptr_t a = (uintptr_t)p;
++    tInside = true;
++    {
++        std::lock_guard<std::mutex> lock(Mu());
++        Blocks()[a] = { f.path, f.next, (uint32_t)n };
++        Keys()[Key(f.path, f.next)] = a;
++    }
++    tInside = false;
++    f.next++;
++    gCount.fetch_add(1, std::memory_order_relaxed);
++    uintptr_t lo = gLo.load(std::memory_order_relaxed);
++    while (a < lo && !gLo.compare_exchange_weak(lo, a)) {
++    }
++    uintptr_t hi = gHi.load(std::memory_order_relaxed);
++    while (a + n > hi && !gHi.compare_exchange_weak(hi, a + n)) {
++    }
++}
++
++static void OnFree(void* p) {
++    if (p == nullptr || tInside || gCount.load(std::memory_order_relaxed) == 0) return;
++    const uintptr_t a = (uintptr_t)p;
++    if (a < gLo.load(std::memory_order_relaxed) || a >= gHi.load(std::memory_order_relaxed)) return;
++    tInside = true;
++    {
++        std::lock_guard<std::mutex> lock(Mu());
++        auto it = Blocks().find(a);
++        if (it != Blocks().end()) {
++            auto kt = Keys().find(Key(it->second.path, it->second.idx));
++            if (kt != Keys().end() && kt->second == a) Keys().erase(kt);
++            Blocks().erase(it);
++            gCount.fetch_sub(1, std::memory_order_relaxed);
++        }
++    }
++    tInside = false;
++}
++
++// A copy of the registry, sorted by address, for scanning a state without holding the lock
++struct Range {
++    uintptr_t base, end;
++    uint32_t path, idx;
++};
++static std::vector<Range> Snapshot() {
++    std::vector<Range> out;
++    std::lock_guard<std::mutex> lock(Mu());
++    out.reserve(Blocks().size());
++    for (auto& b : Blocks()) out.push_back({ b.first, b.first + b.second.size, b.second.path, b.second.idx });
++    return out;
++}
++static std::string PathOf(uint32_t id) {
++    std::lock_guard<std::mutex> lock(Mu());
++    return id < Paths().size() ? std::string(Paths()[id]) : std::string();
++}
++// The block idx of path, of the given size: the one numbered idx, or the nearest same-sized one if an unrelated
++// allocation shifted the numbering in this run
++static bool Lookup(const std::string& path, uint32_t idx, uint32_t size, uintptr_t& base) {
++    std::lock_guard<std::mutex> lock(Mu());
++    auto it = Index().find(path.c_str());
++    if (it == Index().end()) return false;
++    for (int d = 0; d <= 4; d++) {
++        for (int s = (d == 0 ? 1 : -1); s <= 1; s += 2) {
++            const int64_t i = (int64_t)idx + s * d;
++            if (i < 0) continue;
++            auto kt = Keys().find(Key(it->second, (uint32_t)i));
++            if (kt == Keys().end()) continue;
++            auto bt = Blocks().find(kt->second);
++            if (bt != Blocks().end() && bt->second.size == size) {
++                base = kt->second;
++                return true;
++            }
++        }
++    }
++    return false;
++}
++} // namespace frtrack
++
++extern "C" void FrTrack_Push(const char* path) {
++    using namespace frtrack;
++    if (tDepth < kMaxDepth) {
++        uint32_t id;
++        tInside = true;
++        {
++            std::lock_guard<std::mutex> lock(Mu());
++            id = Intern(path);
++        }
++        tInside = false;
++        tStack[tDepth] = { id, 0 };
++    }
++    tDepth++;
++}
++
++extern "C" void FrTrack_Pop(void) {
++    if (frtrack::tDepth > 0) frtrack::tDepth--;
++}
++
++// The executable's C allocations (--wrap: Ghostship, libultraship, Torch), recorded the same way
++extern "C" void* __wrap_malloc(size_t n) {
++    void* p = __real_malloc(n);
++    frtrack::OnAlloc(p, n);
++    return p;
++}
++extern "C" void* __wrap_calloc(size_t n, size_t m) {
++    void* p = __real_calloc(n, m);
++    frtrack::OnAlloc(p, n * m);
++    return p;
++}
++extern "C" void* __wrap_realloc(void* old, size_t n) {
++    frtrack::OnFree(old);
++    void* p = __real_realloc(old, n);
++    frtrack::OnAlloc(p, n);
++    return p;
++}
++extern "C" void __wrap_free(void* p) {
++    frtrack::OnFree(p);
++    __real_free(p);
++}
++
++// The program-wide allocator: plain malloc, plus the record above while an asset is being built.
++void* operator new(std::size_t n) {
++    void* p = __real_malloc(n ? n : 1);
++    if (p == nullptr) throw std::bad_alloc();
++    frtrack::OnAlloc(p, n);
++    return p;
++}
++void* operator new[](std::size_t n) {
++    return ::operator new(n);
++}
++void* operator new(std::size_t n, const std::nothrow_t&) noexcept {
++    void* p = __real_malloc(n ? n : 1);
++    frtrack::OnAlloc(p, n);
++    return p;
++}
++void* operator new[](std::size_t n, const std::nothrow_t& t) noexcept {
++    return ::operator new(n, t);
++}
++void* operator new(std::size_t n, std::align_val_t al) {
++    std::size_t a = (std::size_t)al < sizeof(void*) ? sizeof(void*) : (std::size_t)al;
++    void* p = nullptr;
++    if (posix_memalign(&p, a, n ? n : 1) != 0) throw std::bad_alloc();
++    frtrack::OnAlloc(p, n);
++    return p;
++}
++void* operator new[](std::size_t n, std::align_val_t al) {
++    return ::operator new(n, al);
++}
++void* operator new(std::size_t n, std::align_val_t al, const std::nothrow_t&) noexcept {
++    try {
++        return ::operator new(n, al);
++    } catch (...) { return nullptr; }
++}
++void* operator new[](std::size_t n, std::align_val_t al, const std::nothrow_t& t) noexcept {
++    return ::operator new(n, al, t);
++}
++void operator delete(void* p) noexcept {
++    frtrack::OnFree(p);
++    __real_free(p);
++}
++void operator delete[](void* p) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void* p, std::size_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void* p, std::size_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void* p, const std::nothrow_t&) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void* p, const std::nothrow_t&) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void* p, std::align_val_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void* p, std::align_val_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void* p, std::size_t, std::align_val_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void* p, std::size_t, std::align_val_t) noexcept {
++    ::operator delete(p);
++}
++void operator delete(void* p, std::align_val_t, const std::nothrow_t&) noexcept {
++    ::operator delete(p);
++}
++void operator delete[](void* p, std::align_val_t, const std::nothrow_t&) noexcept {
++    ::operator delete(p);
++}
++
++// ================================================================================================
++// States in memory
++// ================================================================================================
++namespace frstate {
++enum { R_DATA, R_BSS, R_POOL_L, R_POOL_R, R_COUNT };
++
++struct State {
++    uintptr_t base[R_COUNT] = {};
++    std::vector<uint8_t> mem[R_COUNT];
++    std::vector<std::shared_ptr<Ship::IResource>> keep; // assets a state read from the card points into
++};
++
++// Where each part of a state lives right now
++static void Ranges(uintptr_t base[R_COUNT], size_t size[R_COUNT]) {
++    base[R_DATA] = (uintptr_t)__fr_data_start;
++    size[R_DATA] = (size_t)(__fr_data_end - __fr_data_start);
++    base[R_BSS] = (uintptr_t)__fr_bss_start;
++    size[R_BSS] = (size_t)(__fr_bss_end - __fr_bss_start);
++    // the main pool grows from both ends: the left stack up to its list head (and that header), the right one
++    // down from the end
++    base[R_POOL_L] = (uintptr_t)sPoolStart - 16;
++    size[R_POOL_L] = (uintptr_t)sPoolListHeadL + 16 - base[R_POOL_L];
++    base[R_POOL_R] = (uintptr_t)sPoolListHeadR;
++    size[R_POOL_R] = (uintptr_t)sPoolEnd + 16 - base[R_POOL_R];
++}
++
++static std::shared_ptr<State> Save() {
++    auto st = std::make_shared<State>();
++    size_t size[R_COUNT];
++    Ranges(st->base, size);
++    for (int r = 0; r < R_COUNT; r++) {
++        st->mem[r].assign((const uint8_t*)st->base[r], (const uint8_t*)st->base[r] + size[r]);
++    }
++    return st;
++}
++
++// A state's parts must land inside this run's ranges (the same build: the same addresses)
++static bool Fits(const State& st) {
++    uintptr_t base[R_COUNT];
++    size_t size[R_COUNT];
++    Ranges(base, size);
++    if (st.base[R_DATA] != base[R_DATA] || st.mem[R_DATA].size() != size[R_DATA] || st.base[R_BSS] != base[R_BSS] ||
++        st.mem[R_BSS].size() != size[R_BSS]) {
++        return false;
++    }
++    const uintptr_t lo = (uintptr_t)sPoolStart - 16, hi = (uintptr_t)sPoolEnd + 16;
++    for (int r = R_POOL_L; r <= R_POOL_R; r++) {
++        if (st.base[r] < lo || st.base[r] + st.mem[r].size() > hi) return false;
++    }
++    return true;
++}
++
++static void Load(const State& st) {
++    // the pool's bounds are read before the bss (which holds them) is overwritten
++    for (int r = 0; r < R_COUNT; r++) {
++        memcpy((void*)st.base[r], st.mem[r].data(), st.mem[r].size());
++    }
++    gfx_texture_cache_clear(); // textures the game builds in its own memory may have changed under their address
++}
++} // namespace frstate
++
++// ================================================================================================
++// States on the card
++// ================================================================================================
++namespace frdisk {
++static const char kBuild[24] = __DATE__ " " __TIME__; // a state only loads into the build that wrote it
++static const uint32_t kVersion = 1;
++
++struct Header {
++    char magic[4];
++    uint32_t version;
++    char build[24];
++    uint32_t base[frstate::R_COUNT], size[frstate::R_COUNT];
++    uint32_t o2rSize, nPaths, nFixups;
++};
++struct Fixup {
++    uint32_t region, offset, path, idx, size, delta;
++};
++
++static std::string Dir() {
++    return Ship::Context::GetPathRelativeToAppDirectory("states", "sm64");
++}
++static std::string FileFor(unsigned slot) {
++    return Dir() + "/slot" + std::to_string(slot) + ".frstate";
++}
++// the assets a state points into come from this sm64.o2r: a US state doesn't go into a Japanese game
++static uint32_t O2rSize() {
++    std::error_code ec;
++    auto n = std::filesystem::file_size(Ship::Context::LocateFileAcrossAppDirs("sm64.o2r", "sm64"), ec);
++    return ec ? 0 : (uint32_t)n;
++}
++
++// Zero runs dominate: [nonzero word count][words][zero word count]...
++static void Encode(const std::vector<uint8_t>& in, std::vector<uint8_t>& out) {
++    const size_t words = in.size() / 4;
++    const uint32_t* w = reinterpret_cast<const uint32_t*>(in.data());
++    out.clear();
++    auto put = [&](uint32_t v) { out.insert(out.end(), (uint8_t*)&v, (uint8_t*)&v + 4); };
++    size_t i = 0;
++    while (i < words) {
++        size_t s = i;
++        while (i < words && w[i] != 0) i++;
++        put((uint32_t)(i - s));
++        out.insert(out.end(), (const uint8_t*)(w + s), (const uint8_t*)(w + i));
++        s = i;
++        while (i < words && w[i] == 0) i++;
++        put((uint32_t)(i - s));
++    }
++}
++static bool Decode(const uint8_t* in, size_t len, std::vector<uint8_t>& out, size_t rawSize) {
++    out.assign(rawSize, 0);
++    size_t pos = 0, o = 0;
++    while (pos + 4 <= len) {
++        uint32_t nz;
++        memcpy(&nz, in + pos, 4);
++        pos += 4;
++        if (pos + (size_t)nz * 4 > len || o + (size_t)nz * 4 > rawSize) return false;
++        memcpy(out.data() + o, in + pos, (size_t)nz * 4);
++        pos += (size_t)nz * 4;
++        o += (size_t)nz * 4;
++        if (pos + 4 > len) break;
++        uint32_t z;
++        memcpy(&z, in + pos, 4);
++        pos += 4;
++        o += (size_t)z * 4;
++        if (o > rawSize) return false;
++    }
++    return true;
++}
++
++static void Scan(const std::vector<uint8_t>& buf, uint32_t region, const std::vector<frtrack::Range>& reg,
++                 std::vector<Fixup>& out) {
++    if (reg.empty()) return;
++    const uintptr_t lo = reg.front().base, hi = reg.back().end;
++    const size_t len = buf.size();
++    for (size_t o = 0; o + 4 <= len; o += 4) {
++        uint32_t v;
++        memcpy(&v, buf.data() + o, 4);
++        if (v < lo || v >= hi) continue;
++        auto it = std::upper_bound(reg.begin(), reg.end(), (uintptr_t)v,
++                                   [](uintptr_t x, const frtrack::Range& r) { return x < r.base; });
++        if (it == reg.begin()) continue;
++        --it;
++        if (v >= it->end) continue;
++        out.push_back({ region, (uint32_t)o, it->path, it->idx, (uint32_t)(it->end - it->base),
++                        (uint32_t)(v - it->base) });
++    }
++}
++
++static void Pad(std::vector<uint8_t>& raw) {
++    while (raw.size() % 4) raw.push_back(0);
++}
++
++static bool Write(unsigned slot, const frstate::State& st, const std::vector<frtrack::Range>& reg) {
++    std::vector<Fixup> fix;
++    for (uint32_t r = 0; r < frstate::R_COUNT; r++) Scan(st.mem[r], r, reg, fix);
++    // the asset paths the fixups name, renumbered from 0
++    std::map<uint32_t, uint32_t> remap;
++    std::vector<std::string> paths;
++    for (auto& f : fix) {
++        auto it = remap.find(f.path);
++        if (it == remap.end()) {
++            it = remap.emplace(f.path, (uint32_t)paths.size()).first;
++            paths.push_back(frtrack::PathOf(f.path));
++        }
++        f.path = it->second;
++    }
++
++    std::vector<uint8_t> raw;
++    auto put = [&](const void* p, size_t n) { raw.insert(raw.end(), (const uint8_t*)p, (const uint8_t*)p + n); };
++    Header h = {};
++    memcpy(h.magic, "FRM1", 4);
++    h.version = kVersion;
++    memcpy(h.build, kBuild, sizeof(h.build));
++    for (int r = 0; r < frstate::R_COUNT; r++) {
++        h.base[r] = (uint32_t)st.base[r];
++        h.size[r] = (uint32_t)st.mem[r].size();
++    }
++    h.o2rSize = O2rSize();
++    h.nPaths = (uint32_t)paths.size();
++    h.nFixups = (uint32_t)fix.size();
++    put(&h, sizeof(h));
++    for (auto& p : paths) put(p.c_str(), p.size() + 1);
++    Pad(raw);
++    put(fix.data(), fix.size() * sizeof(Fixup));
++    for (int r = 0; r < frstate::R_COUNT; r++) {
++        put(st.mem[r].data(), st.mem[r].size());
++        Pad(raw);
++    }
++
++    std::vector<uint8_t> enc;
++    Encode(raw, enc);
++    std::error_code ec;
++    std::filesystem::create_directories(Dir(), ec);
++    const std::string file = FileFor(slot), tmp = file + ".tmp";
++    FILE* f = fopen(tmp.c_str(), "wb");
++    if (f == nullptr) return false;
++    uint32_t rawSize = (uint32_t)raw.size();
++    bool ok = fwrite("FRSZ", 1, 4, f) == 4 && fwrite(&rawSize, 4, 1, f) == 1 &&
++              fwrite(enc.data(), 1, enc.size(), f) == enc.size();
++    ok = (fflush(f) == 0) && ok;
++    fsync(fileno(f));
++    fclose(f);
++    if (!ok || rename(tmp.c_str(), file.c_str()) != 0) {
++        remove(tmp.c_str());
++        return false;
++    }
++    SPDLOG_INFO("[FakeR36S] state {} written to the card: {} pointers into {} assets, {} KB ({} KB in memory)", slot,
++                fix.size(), paths.size(), (enc.size() + 8) / 1024, raw.size() / 1024);
++    return true;
++}
++
++// Reads slot's file into a new state, assets reloaded and their pointers rebuilt; nullptr if it can't
++static std::shared_ptr<frstate::State> Read(unsigned slot) {
++    FILE* f = fopen(FileFor(slot).c_str(), "rb");
++    if (f == nullptr) return nullptr;
++    std::vector<uint8_t> file;
++    uint8_t chunk[65536];
++    size_t n;
++    while ((n = fread(chunk, 1, sizeof(chunk), f)) > 0) file.insert(file.end(), chunk, chunk + n);
++    fclose(f);
++    if (file.size() < 8 || memcmp(file.data(), "FRSZ", 4) != 0) return nullptr;
++    uint32_t rawSize;
++    memcpy(&rawSize, file.data() + 4, 4);
++    std::vector<uint8_t> raw;
++    if (!Decode(file.data() + 8, file.size() - 8, raw, rawSize)) return nullptr;
++    file.clear();
++    file.shrink_to_fit();
++
++    size_t pos = 0;
++    auto need = [&](size_t k) { return pos + k <= raw.size(); };
++    if (!need(sizeof(Header))) return nullptr;
++    Header h;
++    memcpy(&h, raw.data(), sizeof(h));
++    pos += sizeof(h);
++    if (memcmp(h.magic, "FRM1", 4) != 0 || h.version != kVersion) return nullptr;
++    if (memcmp(h.build, kBuild, sizeof(h.build)) != 0) {
++        SPDLOG_WARN("[FakeR36S] state {} is from another build of the game: not loading it", slot);
++        return nullptr;
++    }
++    if (h.o2rSize != O2rSize()) {
++        SPDLOG_WARN("[FakeR36S] state {} was saved with another sm64.o2r (ROM version): not loading it", slot);
++        return nullptr;
++    }
++    std::vector<std::string> paths;
++    for (uint32_t i = 0; i < h.nPaths; i++) {
++        size_t e = pos;
++        while (e < raw.size() && raw[e] != 0) e++;
++        if (e >= raw.size()) return nullptr;
++        paths.emplace_back((const char*)raw.data() + pos, e - pos);
++        pos = e + 1;
++    }
++    pos = (pos + 3) & ~(size_t)3;
++    if (!need((size_t)h.nFixups * sizeof(Fixup))) return nullptr;
++    std::vector<Fixup> fix(h.nFixups);
++    memcpy(fix.data(), raw.data() + pos, fix.size() * sizeof(Fixup));
++    pos += fix.size() * sizeof(Fixup);
++
++    auto st = std::make_shared<frstate::State>();
++    for (int r = 0; r < frstate::R_COUNT; r++) {
++        if (!need(h.size[r])) return nullptr;
++        st->base[r] = h.base[r];
++        st->mem[r].assign(raw.data() + pos, raw.data() + pos + h.size[r]);
++        pos = (pos + h.size[r] + 3) & ~(size_t)3;
++    }
++    raw.clear();
++    raw.shrink_to_fit();
++    if (!frstate::Fits(*st)) {
++        SPDLOG_WARN("[FakeR36S] state {} doesn't match this run's memory layout: not loading it", slot);
++        return nullptr;
++    }
++
++    // load every asset the state points into (kept alive with the state), then rebuild the pointers
++    auto rm = ShipCompat::GetResourceManager();
++    for (size_t i = 0; i < paths.size(); i++) {
++        auto res = rm->LoadResource(paths[i], true);
++        if (res == nullptr) {
++            SPDLOG_WARN("[FakeR36S] state {} needs asset {}, which didn't load", slot, paths[i]);
++            return nullptr;
++        }
++        st->keep.push_back(res);
++    }
++    for (auto& x : fix) {
++        uintptr_t base;
++        if (x.path >= paths.size() || !frtrack::Lookup(paths[x.path], x.idx, x.size, base)) {
++            SPDLOG_WARN("[FakeR36S] state {}: block {} ({} bytes) of {} is missing", slot, x.idx, x.size,
++                        x.path < paths.size() ? paths[x.path] : std::string("?"));
++            return nullptr;
++        }
++        if (x.region >= frstate::R_COUNT || (size_t)x.offset + 4 > st->mem[x.region].size()) return nullptr;
++        uint32_t v = (uint32_t)(base + x.delta);
++        memcpy(st->mem[x.region].data() + x.offset, &v, 4);
++    }
++    SPDLOG_INFO("[FakeR36S] state {} read from the card: {} pointers rebuilt in {} assets", slot, fix.size(),
++                paths.size());
++    return st;
++}
++
++// One background writer, so the game never waits on the SD card
++struct Job {
++    unsigned slot;
++    std::shared_ptr<frstate::State> st;
++    std::vector<frtrack::Range> reg;
++};
++// Never destroyed: the writer thread sleeps on cv, and destroying a condition variable that a thread is still
++// waiting on (as static destructors would when the game quits) can hang the exit.
++struct Queue {
++    std::mutex mu;
++    std::condition_variable cv;
++    std::deque<Job> jobs;
++    bool workerUp = false;
++};
++static Queue& Q() {
++    static Queue* q = new Queue();
++    return *q;
++}
++static std::atomic<int> pending{ 0 };
++
++static void Worker() {
++    for (;;) {
++        Job job;
++        {
++            std::unique_lock<std::mutex> lock(Q().mu);
++            Q().cv.wait(lock, [] { return !Q().jobs.empty(); });
++            job = std::move(Q().jobs.front());
++            Q().jobs.pop_front();
++        }
++        if (!Write(job.slot, *job.st, job.reg)) SPDLOG_ERROR("[FakeR36S] could not write state {}", job.slot);
++        job.st.reset();
++        pending.fetch_sub(1);
++    }
++}
++
++static void Enqueue(unsigned slot, std::shared_ptr<frstate::State> st) {
++    if (st == nullptr) return;
++    Job job{ slot, std::move(st), frtrack::Snapshot() }; // the registry as it is now, with the state
++    Queue& q = Q();
++    std::lock_guard<std::mutex> lock(q.mu);
++    // a newer copy of the same slot replaces one still waiting
++    for (auto it = q.jobs.begin(); it != q.jobs.end(); ++it) {
++        if (it->slot == slot) {
++            *it = std::move(job);
++            q.cv.notify_one();
++            return;
++        }
++    }
++    q.jobs.push_back(std::move(job));
++    pending.fetch_add(1);
++    if (!q.workerUp) {
++        std::thread(Worker).detach();
++        q.workerUp = true;
++    }
++    q.cv.notify_one();
++}
++
++static void WaitIdle(uint32_t ms) {
++    const uint32_t until = SDL_GetTicks() + ms;
++    while (pending.load() > 0 && SDL_GetTicks() < until) SDL_Delay(20);
++}
++} // namespace frdisk
++
++// ================================================================================================
++// Hotkeys
++// ================================================================================================
++#define FR_SLOTS 6
++#define FR_AUTOSAVE_SLOT 9
++#define FR_RESUME_SLOT 10 // the previous run's autosave, set aside at start (the first Select+X loads it)
++#define FR_INPUT_BLOCK 0x4652 // ControlDeck block id while Select is held
++
++static std::map<unsigned, std::shared_ptr<frstate::State>> sStates;
++static unsigned sSlot = 0;
++static uint32_t sFrames = 0;
++
++static SDL_GameController* FR_Pad(void) {
++    for (int i = 0; i < SDL_NumJoysticks(); i++) {
++        if (!SDL_IsGameController(i)) continue;
++        SDL_GameController* pad = SDL_GameControllerFromInstanceID(SDL_JoystickGetDeviceInstanceID(i));
++        if (pad != nullptr) return pad;
++    }
++    return nullptr;
++}
++
++static void FR_Notify(const std::string& text) {
++    auto window = ShipCompat::GetWindow();
++    if (window == nullptr || window->GetGui() == nullptr || window->GetGui()->GetGameOverlay() == nullptr) return;
++    window->GetGui()->GetGameOverlay()->TextDrawNotification(1.5f, true, "%s", text.c_str());
++}
++
++static bool FR_Enabled(void) {
++    return CVarGetInteger("gFakeR36S.SaveStates", 1) != 0 && sFrames > 60;
++}
++
++static void FR_SaveSlot(unsigned slot, bool toCard, bool notify) {
++    auto st = frstate::Save();
++    sStates[slot] = st;
++    if (toCard) frdisk::Enqueue(slot, st);
++    if (notify) FR_Notify("Saved state " + std::to_string(slot));
++}
++
++static void FR_LoadSlot(unsigned slot, bool notify) {
++    if (sStates.find(slot) == sStates.end()) { // after a restart: from the card
++        if (auto fromCard = frdisk::Read(slot)) sStates[slot] = fromCard;
++    }
++    auto it = sStates.find(slot);
++    if (it == sStates.end() || !frstate::Fits(*it->second)) {
++        if (notify) FR_Notify(slot >= FR_AUTOSAVE_SLOT ? std::string("No autosave yet") : "No state in slot " + std::to_string(slot));
++        return;
++    }
++    frstate::Load(*it->second);
++    if (notify) FR_Notify(slot >= FR_AUTOSAVE_SLOT ? std::string("Loaded the autosave") : "Loaded state " + std::to_string(slot));
++}
++
++extern "C" void FrSaveStates_Frame(void) {
++    static uint32_t held = 0;         // buttons down last frame, for edge detection
++    static uint32_t lastAutosave = 0; // SDL ticks
++    static uint32_t lastDisk = 0;
++    static bool resumeChecked = false, resumeAvailable = false, blocked = false;
++    sFrames++;
++
++    // Once per run, before this run writes any autosave: the last run's autosave becomes the resume state, so the
++    // new session's rolling autosave can't overwrite it.
++    if (!resumeChecked) {
++        resumeChecked = true;
++        std::error_code ec;
++        const std::string from = frdisk::FileFor(FR_AUTOSAVE_SLOT), to = frdisk::FileFor(FR_RESUME_SLOT);
++        if (std::filesystem::exists(from, ec)) {
++            std::filesystem::rename(from, to, ec);
++            if (!ec) SPDLOG_INFO("[FakeR36S] last run's autosave kept as the resume state");
++        }
++        resumeAvailable = std::filesystem::exists(to, ec);
++        lastAutosave = lastDisk = SDL_GetTicks();
++    }
++
++    SDL_GameController* pad = FR_Pad();
++    const bool sel = pad != nullptr && SDL_GameControllerGetButton(pad, SDL_CONTROLLER_BUTTON_BACK);
++
++    // the game doesn't see the buttons of a combo
++    auto deck = ShipCompat::GetControlDeck();
++    if (deck != nullptr && sel != blocked) {
++        if (sel) deck->BlockGameInput(FR_INPUT_BLOCK); else deck->UnblockGameInput(FR_INPUT_BLOCK);
++        blocked = sel;
++    }
++
++    uint32_t now = 0;
++    if (sel) {
++        const SDL_GameControllerButton watched[] = {
++            SDL_CONTROLLER_BUTTON_START,      SDL_CONTROLLER_BUTTON_B,          SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,
++            SDL_CONTROLLER_BUTTON_LEFTSHOULDER, SDL_CONTROLLER_BUTTON_DPAD_RIGHT, SDL_CONTROLLER_BUTTON_DPAD_LEFT,
++            SDL_CONTROLLER_BUTTON_X,
++        };
++        for (int b = 0; b < 7; b++) {
++            if (SDL_GameControllerGetButton(pad, watched[b])) now |= 1u << b;
++        }
++    }
++    const uint32_t pressed = now & ~held;
++    held = now;
++
++    if (pressed & 1) {
++        // Select + Start: quit cleanly, back to EmulationStation (fr-padwatch sees it too); FrSaveStates_Quit writes
++        // the autosave on the way out
++        SDL_Event e = {};
++        e.type = SDL_QUIT;
++        SDL_PushEvent(&e);
++        return;
++    }
++    if (pressed & 2) {
++        auto window = ShipCompat::GetWindow();
++        auto stats = window != nullptr && window->GetGui() != nullptr ? window->GetGui()->GetGuiWindow("Stats") : nullptr;
++        if (stats != nullptr) {
++            if (stats->IsVisible()) stats->Hide(); else stats->Show();
++        }
++    }
++
++    if (!FR_Enabled()) return;
++
++    if (pressed & 4) {
++        FR_SaveSlot(sSlot, CVarGetInteger("gFakeR36S.StatesToCard", 1) != 0, true);
++    } else if (pressed & 8) {
++        FR_LoadSlot(sSlot, true);
++        lastAutosave = SDL_GetTicks(); // don't overwrite the autosave right after a load
++    } else if (pressed & 16) {
++        sSlot = sSlot + 1 >= FR_SLOTS ? 0 : sSlot + 1;
++        FR_Notify("State slot " + std::to_string(sSlot));
++    } else if (pressed & 32) {
++        sSlot = sSlot == 0 ? FR_SLOTS - 1 : sSlot - 1;
++        FR_Notify("State slot " + std::to_string(sSlot));
++    } else if (pressed & 64) {
++        // the first Select+X of a run resumes the last run; after that it goes back to this run's autosave
++        if (resumeAvailable) {
++            resumeAvailable = false;
++            FR_LoadSlot(FR_RESUME_SLOT, true);
++        } else {
++            FR_LoadSlot(FR_AUTOSAVE_SLOT, true);
++        }
++        lastAutosave = SDL_GetTicks(); // don't overwrite the state we just went back to
++    }
++
++    const int every = CVarGetInteger("gFakeR36S.Autosave", 5);
++    if (every > 0 && SDL_GetTicks() - lastAutosave >= (uint32_t)every * 1000u) {
++        const int disk = CVarGetInteger("gFakeR36S.DiskAutosave", 30); // seconds, 0 = never
++        const bool toCard = disk > 0 && SDL_GetTicks() - lastDisk >= (uint32_t)disk * 1000u;
++        FR_SaveSlot(FR_AUTOSAVE_SLOT, toCard, false); // silent: no notification every 5 seconds
++        lastAutosave = SDL_GetTicks();
++        if (toCard) lastDisk = lastAutosave;
++    }
++}
++
++// The game loop has ended (Select+Start, the menu, fr-padwatch's SIGTERM): keep the moment you quit
++extern "C" void FrSaveStates_Quit(void) {
++    if (!FR_Enabled() || CVarGetInteger("gFakeR36S.Autosave", 5) <= 0) {
++        frdisk::WaitIdle(8000);
++        return;
++    }
++    FR_SaveSlot(FR_AUTOSAVE_SLOT, true, false);
++    frdisk::WaitIdle(4000);
++    SPDLOG_INFO("[FakeR36S] autosave written on quit");
++}
++
++#endif // FAKER36S
+diff --git a/src/port/Game.cpp b/src/port/Game.cpp
+index 79954e6..2a7264f 100644
+--- a/src/port/Game.cpp
++++ b/src/port/Game.cpp
+@@ -32,7 +32,16 @@ extern "C" void exec_display_list(SPTask* spTask) {
+     GameEngine::ProcessGfxCommands((Gfx*)spTask->task.t.data_ptr);
+ }
+ 
++#ifdef FAKER36S
++// FakeR36S: hotkeys and save states, between two frames (src/port/FrSaveStates.cpp)
++extern "C" void FrSaveStates_Frame(void);
++extern "C" void FrSaveStates_Quit(void);
++#endif
++
+ void push_frame() {
++#ifdef FAKER36S
++    FrSaveStates_Frame();
++#endif
+     GameEngine::StartAudioFrame();
+     GameEngine::Instance->StartFrame();
+     thread5_iteration();
+@@ -85,6 +94,9 @@ int main(int argc, char* argv[]) {
+     while (WindowIsRunning()) {
+         push_frame();
+     }
++#ifdef FAKER36S
++    FrSaveStates_Quit();
++#endif
+     GameEngine::Instance->Destroy();
+     return 0;
+ }
+\ No newline at end of file
