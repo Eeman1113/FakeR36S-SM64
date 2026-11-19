@@ -4,6 +4,8 @@ Super Mario 64 running natively (no emulator) on the fake R36S / GA36-MB handhel
 
 It is the sibling of [FakeR36S-Ocarina](https://github.com/Eeman1113/FakeR36S-Ocarina) (Ocarina of Time and Majora's Mask) and is built the same way: GitHub Actions builds the game in a Debian cross toolchain, with the patches in `patches/`, and packs it as a port that shows up in EmulationStation under **Ports**.
 
+Status: builds and passes its checks in CI (the armhf binary has no ARMv8-only instruction, every GLES2 shader variant compiles with glslang and with lima's own compiler, and the package starts under qemu-arm with Mesa's GLES2); not yet tested on the console itself.
+
 **No game files are included.** You need your own Super Mario 64 ROM, the N64 USA or Japan version. The game builds its assets from it on the first start, on the console.
 
 ## Install on FakeR36S-OS
@@ -29,6 +31,8 @@ If the ROM is a version Ghostship does not take (it takes the US and Japan N64 v
 | Select + X | Go back to the autosave (refreshed every 5 seconds of gameplay). The first Select+X after a restart resumes where your last session ended |
 
 The game ignores its own buttons while Select is held, so the combos don't make Mario jump or move the camera.
+
+Ghostship's own menu (settings, enhancements) opens with F1 on a USB keyboard; it is left off the gamepad so Select stays free for the combos (set `gControlNav` to 1 in `HOME/.config/sm64/ghostship.cfg.json` to open it with Select alone).
 
 ### Save states
 
