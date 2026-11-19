@@ -203,14 +203,16 @@ bad = []
 stats = 0
 for k, lines in sections.items():
     text = "\n".join(lines)
-    n = len(re.findall(r"SHADER-DB: MESA_SHADER_(VERTEX|FRAGMENT) shader:", text))
-    stats += n
-    # both shaders must have compiled (a stats line each) and lima must not have complained
-    if n < 2 or re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
+    stats += len(re.findall(r"SHADER-DB: MESA_SHADER_(VERTEX|FRAGMENT) shader:", text))
+    # every fragment shader is new and gets compiled (a stats line); a vertex shader whose NIR lima has already
+    # compiled comes from its cache, without a line. Nothing may fail or make lima complain.
+    if not re.search(r"MESA_SHADER_FRAGMENT shader:", text) or \
+            re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
         bad.append((k, text))
 insts = [int(x) for x in re.findall(r"MESA_SHADER_VERTEX shader: (\d+) inst", "\n".join(log))]
 finsts = [int(x) for x in re.findall(r"MESA_SHADER_FRAGMENT shader: (\d+) inst", "\n".join(log))]
-print(f"== lima: {len(sections)} programs, {stats} shaders compiled, {len(bad)} with errors")
+print(f"== lima: {len(sections)} programs, {stats} shaders compiled ({len(insts)} vertex, the rest from lima's "
+      f"cache), {len(bad)} with errors")
 if insts and finsts:
     print(f"== vertex instructions: max {max(insts)}, mean {sum(insts) // len(insts)}; "
           f"fragment: max {max(finsts)}, mean {sum(finsts) // len(finsts)}")
