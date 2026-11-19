@@ -171,6 +171,7 @@ lima() {
     n=$(ls "$d"/*.vert | wc -l)
     gcc -O1 -Wall -I$m/include "$HERE/tools/limacheck/limacheck.c" -L"$lib" -Wl,-rpath,"$lib" -lEGL -lGLESv2 -lgbm \
         -o "$BLD/limacheck"
+    LD_LIBRARY_PATH=$lib:$(dirname "$(find $m -name 'libgallium*.so' | head -1)") \
     LD_PRELOAD=$m/liblima_noop_drm_shim.so LIMA_DEBUG=shaderdb,precompile LIBGL_DRIVERS_PATH=$lib/dri \
         GBM_BACKENDS_PATH=$lib/gbm "$BLD/limacheck" "$d" "$n" > "$d/lima.log" 2>&1 || true
     mkdir -p /repo/out/lima
