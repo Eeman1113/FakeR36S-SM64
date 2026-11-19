@@ -92,11 +92,12 @@ game() {
     toolchain
     build_libzip
     cmake -S "$SRC" -B "$BLD/armhf" -G Ninja -DCMAKE_TOOLCHAIN_FILE="$BLD/armhf.cmake" -DCMAKE_PREFIX_PATH="$PREFIX" \
-        -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$ARMFLAGS" -DCMAKE_CXX_FLAGS="$ARMFLAGS" \
+        -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_FLAGS="$ARMFLAGS -isystem $PREFIX/include" \
+        -DCMAKE_CXX_FLAGS="$ARMFLAGS -isystem $PREFIX/include" \
         -DCMAKE_PROJECT_Ghostship_INCLUDE="$HERE/cmake/ghostship-deps.cmake" \
         -DUSE_OPENGLES=ON -DUSE_GLES2=ON -DENABLE_SCRIPTING=OFF -DUSE_SATELLA=OFF -DUSE_NETWORKING=OFF -DFAKER36S=ON \
         -DCMAKE_EXE_LINKER_FLAGS=-no-pie
-    cmake --build "$BLD/armhf" -j "$JOBS" --target $ELF
+    cmake --build "$BLD/armhf" -j "$JOBS" --target $ELF -- -k 0
     cp "$BLD/armhf/$ELF" "$OUT/"
     arm-linux-gnueabihf-strip "$OUT/$ELF"
     ls -l "$OUT/$ELF"

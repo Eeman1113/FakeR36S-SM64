@@ -588,12 +588,41 @@ index 9d6a4e75..5a75c4a6 100644
  #elif defined(USE_OPENGLES)
      SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
      SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index b6dd2ae6..b8da1475 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -2595,7 +2595,12 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+     // N64 texture LOD: when a real mip pyramid is described by the tiles, bind it
+     // as a GPU mip chain (MIP_LOD); LOD_FRACTION is then computed per-pixel in the
+     // fragment shader from UV derivatives (TEX_LOD).
++#ifdef USE_GLES2
++    // GLES2: no mip chains (no GL_TEXTURE_MAX_LEVEL, no textureLod): each tile is its own texture, as before
++    uint8_t mipExtraLevels = 0;
++#else
+     uint8_t mipExtraLevels = DetectMipChain(mRdp->first_tile_index);
++#endif
+     if (mRdp->other_mode_h & G_TL_LOD) {
+         cc_options |= SHADER_OPT(TEX_LOD);
+     }
+@@ -2630,6 +2635,11 @@ void Interpreter::GfxSpTri1(uint8_t vtx1_idx, uint8_t vtx2_idx, uint8_t vtx3_idx
+ 
+     bool palettized[2] = { false, false };
+     for (int i = 0; i < 2; i++) {
++#ifdef USE_GLES2
++        // GLES2: CI textures are decoded on the CPU, so the Mali-400 samples them once with its own bilinear filter
++        // instead of four palette lookups per pixel
++        break;
++#endif
+         uint32_t pal_tile = mRdp->first_tile_index + i;
+         if (i == 1 && mRdp->first_tile_index >= 2) {
+             pal_tile = mRdp->first_tile_index;
 diff --git a/src/fast/shaders/opengl/gles2.shader.glsl b/src/fast/shaders/opengl/gles2.shader.glsl
 new file mode 100644
-index 00000000..27e611b3
+index 00000000..4fd1275b
 --- /dev/null
 +++ b/src/fast/shaders/opengl/gles2.shader.glsl
-@@ -0,0 +1,420 @@
+@@ -0,0 +1,421 @@
 +@prism(type='fragment', name='Fast3D GLES2 Shader', version='1.0.0', description='default.shader.glsl and its includes for GLSL ES 1.00 (Mali-400 / lima)', author='Emill, Prism Team, FakeR36S')
 +
 +@{GLSL_VERSION}
@@ -644,7 +673,7 @@ index 00000000..27e611b3
 +    @if(o_lighting)
 +        uniform vec4 uAmbient;
 +        uniform int uNumLights;
-+        uniform vec4 uLights[96];
++        uniform vec4 uLights[21];
 +        @if(o_point_lighting)
 +            uniform vec4 uMvRows[3];
 +            uniform vec4 uMvCols[3];
@@ -661,11 +690,22 @@ index 00000000..27e611b3
 +        @end
 +    @end
 +
++    // Written for lima's vertex compiler: no indirect uniform loads (the palette slot is picked with selects), no
++    // loops it would have to keep (the lights are unrolled) and no branches (selects instead)
 +    void main() {
 +        // RSP position transform: matrix palette entry selected per vertex
-+        int mtxBase = int(aMtxSlot + 0.5) * 4;
-+        vec4 clipPos = aVtxPos.x * uMtxPalette[mtxBase] + aVtxPos.y * uMtxPalette[mtxBase + 1] +
-+                       aVtxPos.z * uMtxPalette[mtxBase + 2] + aVtxPos.w * uMtxPalette[mtxBase + 3];
++        float slot = floor(aMtxSlot + 0.5);
++        vec4 m0 = uMtxPalette[0];
++        vec4 m1 = uMtxPalette[1];
++        vec4 m2 = uMtxPalette[2];
++        vec4 m3 = uMtxPalette[3];
++        @for(k in 1..8)
++            m0 = slot > float(@{k}) - 0.5 ? uMtxPalette[@{k} * 4] : m0;
++            m1 = slot > float(@{k}) - 0.5 ? uMtxPalette[@{k} * 4 + 1] : m1;
++            m2 = slot > float(@{k}) - 0.5 ? uMtxPalette[@{k} * 4 + 2] : m2;
++            m3 = slot > float(@{k}) - 0.5 ? uMtxPalette[@{k} * 4 + 3] : m3;
++        @end
++        vec4 clipPos = aVtxPos.x * m0 + aVtxPos.y * m1 + aVtxPos.z * m2 + aVtxPos.w * m3;
 +
 +        @for(i in 0..2)
 +            @if(o_textures[i])
@@ -676,9 +716,7 @@ index 00000000..27e611b3
 +        @if(o_fog)
 +            float fogW = abs(clipPos.w) < 0.001 ? 0.001 : clipPos.w;
 +            float fogWinv = 1.0 / fogW;
-+            if (fogWinv < 0.0) {
-+                fogWinv = 32767.0;
-+            }
++            fogWinv = fogWinv < 0.0 ? 32767.0 : fogWinv;
 +            float fogCalc = clamp(clipPos.z * fogWinv * uFogParams.x + uFogParams.y, 0.0, 255.0) / 255.0;
 +            @if(o_shade && o_alpha)
 +                vFogFactor = uFogParams.w > 1.5 ? aShade.a : (uFogParams.w > 0.5 ? uFogParams.z : fogCalc);
@@ -706,9 +744,7 @@ index 00000000..27e611b3
 +        @if(o_shade && o_alpha)
 +            float shadeAlpha = aShade.a;
 +            @if(o_fog)
-+                if (uFogParams.w < 0.5 || uFogParams.w > 1.5) {
-+                    shadeAlpha = 1.0;
-+                }
++                shadeAlpha = (uFogParams.w < 0.5 || uFogParams.w > 1.5) ? 1.0 : shadeAlpha;
 +            @end
 +        @end
 +        @if(o_point_lighting)
@@ -716,34 +752,28 @@ index 00000000..27e611b3
 +        @end
 +        @if(o_shade)
 +            @if(o_lighting)
-+                // N64 RSP lighting: aShade carries the raw signed vertex normal. GLSL ES 1.00 (and lima's
-+                // vertex compiler) wants a loop it can unroll: a constant bound, the light count as a test.
++                // N64 RSP lighting: aShade carries the raw signed vertex normal; up to 7 lights
 +                vec3 litColor = uAmbient.rgb;
-+                for (int i = 0; i < 7; i++) {
-+                    if (i < uNumLights) {
-+                        float intensity = 0.0;
-+                        @if(o_point_lighting)
-+                        if (uLights[i * 3].w > 0.5) {
-+                            vec3 distVec = uLights[i * 3 + 2].xyz - worldPos;
-+                            float distSq = distVec.x * distVec.x + distVec.y * distVec.y + distVec.z * distVec.z * 2.0;
-+                            float dist = sqrt(distSq);
-+                            vec3 lightModel = vec3(dot(distVec, uMvRows[0].xyz), dot(distVec, uMvRows[1].xyz), dot(distVec, uMvRows[2].xyz));
-+                            vec3 lightIntensity = clamp(4.0 * lightModel / distSq, -1.0, 1.0);
-+                            float totalIntensity = clamp(dot(lightIntensity, aShade.xyz), -1.0, 1.0);
-+                            float distF = floor(dist);
-+                            float attenuation = (distF * uLights[i * 3 + 1].w * 2.0 + distF * distF * uLights[i * 3 + 2].w / 8.0) / 65535.0 + 1.0;
-+                            intensity = totalIntensity / attenuation;
-+                        } else {
-+                            intensity = dot(aShade.xyz, uLights[i * 3 + 1].xyz) / 127.0;
-+                        }
-+                        @else
-+                        intensity = dot(aShade.xyz, uLights[i * 3 + 1].xyz) / 127.0;
-+                        @end
-+                        if (intensity > 0.0) {
-+                            litColor += intensity * uLights[i * 3].rgb;
-+                        }
++                float numLights = float(uNumLights);
++                float intensity;
++                @for(l in 0..7)
++                    intensity = dot(aShade.xyz, uLights[@{l} * 3 + 1].xyz) / 127.0;
++                    @if(o_point_lighting)
++                    {
++                        vec3 distVec = uLights[@{l} * 3 + 2].xyz - worldPos;
++                        float distSq = max(distVec.x * distVec.x + distVec.y * distVec.y + distVec.z * distVec.z * 2.0, 0.0001);
++                        float dist = sqrt(distSq);
++                        vec3 lightModel = vec3(dot(distVec, uMvRows[0].xyz), dot(distVec, uMvRows[1].xyz), dot(distVec, uMvRows[2].xyz));
++                        vec3 lightIntensity = clamp(4.0 * lightModel / distSq, -1.0, 1.0);
++                        float totalIntensity = clamp(dot(lightIntensity, aShade.xyz), -1.0, 1.0);
++                        float distF = floor(dist);
++                        float attenuation = (distF * uLights[@{l} * 3 + 1].w * 2.0 + distF * distF * uLights[@{l} * 3 + 2].w / 8.0) / 65535.0 + 1.0;
++                        intensity = uLights[@{l} * 3].w > 0.5 ? totalIntensity / attenuation : intensity;
 +                    }
-+                }
++                    @end
++                    intensity = numLights > float(@{l}) + 0.5 ? max(intensity, 0.0) : 0.0;
++                    litColor += intensity * uLights[@{l} * 3].rgb;
++                @end
 +                litColor = min(litColor, vec3(1.0));
 +                @if(o_alpha)
 +                    vShade = vec4(litColor, shadeAlpha);
