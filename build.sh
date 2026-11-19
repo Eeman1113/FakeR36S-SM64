@@ -10,6 +10,8 @@
 #                          default git describe
 #   ./build.sh smoke [s]   the packaged port under qemu-arm on Xvfb (Mesa llvmpipe, GLES2), with no ROM: it must start,
 #                          make its GLES2 context and draw its first-start window; screenshots in out/smoke
+#   ./build.sh lima        the same GLES2 shader variants through lima's own compiler (the Mali-400 driver, faked by
+#                          Mesa's drm-shim): what the console will compile, without the console
 #   ./build.sh             game, port, libs, check, fakers36s
 # Output in out/sm64. Runs in the fakers36s-sm64 image (Dockerfile), sources and build trees in the sm64-work volume.
 set -euo pipefail
@@ -19,6 +21,10 @@ IMAGE=fakers36s-sm64
 
 if [ ! -f /.dockerenv ]; then
     docker image inspect $IMAGE >/dev/null 2>&1 || docker build -t $IMAGE "$HERE"
+    case " $* " in *" lima "*)
+        docker image inspect $IMAGE-lima >/dev/null 2>&1 || docker build -t $IMAGE-lima -f "$HERE/tools/lima.Dockerfile" "$HERE/tools"
+        IMAGE=$IMAGE-lima ;;
+    esac
     case " $* " in *" smoke "*)
         docker image inspect $IMAGE-smoke >/dev/null 2>&1 || docker build -t $IMAGE-smoke -f "$HERE/tools/smoke.Dockerfile" "$HERE/tools"
         IMAGE=$IMAGE-smoke ;;
@@ -151,6 +157,57 @@ shaders() {
     done
     echo "== $n shader programs, $bad failed"
     [ $bad = 0 ]
+}
+
+# The shader variants of `shaders` compiled, linked and drawn by Mesa's lima driver under its drm-shim (tools/
+# lima.Dockerfile): lima's vertex compiler takes no loops, no indirect uniforms and 304 vec4 of uniforms and temps
+lima() {
+    local m=/opt/mesa lib d=$BLD/lima n
+    lib=$(dirname "$(find $m -name 'libEGL.so' | head -1)")
+    cmake -S "$HERE/tools/shadercheck" -B "$BLD/shadercheck-lima" -G Ninja -DCMAKE_BUILD_TYPE=Release
+    cmake --build "$BLD/shadercheck-lima" -j "$JOBS"
+    rm -rf "$d"; mkdir -p "$d"
+    "$BLD/shadercheck-lima/shadercheck" "$SRC/libultraship/src/fast/shaders/opengl/gles2.shader.glsl" "$d"
+    n=$(ls "$d"/*.vert | wc -l)
+    gcc -O1 -Wall -I$m/include "$HERE/tools/limacheck/limacheck.c" -L"$lib" -Wl,-rpath,"$lib" -lEGL -lGLESv2 -lgbm \
+        -o "$BLD/limacheck"
+    LD_PRELOAD=$m/liblima_noop_drm_shim.so LIMA_DEBUG=shaderdb,precompile LIBGL_DRIVERS_PATH=$lib/dri \
+        GBM_BACKENDS_PATH=$lib/gbm "$BLD/limacheck" "$d" "$n" > "$d/lima.log" 2>&1 || true
+    mkdir -p /repo/out/lima
+    cp "$d/lima.log" /repo/out/lima/
+    python3 - "$d" <<'PY'
+import re, sys, os
+d = sys.argv[1]
+log = open(os.path.join(d, "lima.log"), errors="replace").read().splitlines()
+print("\n".join(log[:3]))
+sections, cur = {}, None
+for line in log:
+    m = re.match(r"== (\d{4})$", line)
+    if m:
+        cur = m.group(1)
+        sections.setdefault(cur, [])
+        continue
+    if cur is not None:
+        sections[cur].append(line)
+bad = []
+stats = 0
+for k, lines in sections.items():
+    text = "\n".join(lines)
+    stats += len(re.findall(r"shader:", text))
+    if re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
+        bad.append((k, text))
+print(f"== lima: {len(sections)} programs, {stats} shader stats lines, {len(bad)} with errors")
+for k, text in bad[:4]:
+    print(f"---- {k}:\n{text[:3000]}")
+    for ext in ("vert", "frag"):
+        print(f"-- {k}.{ext}:")
+        for i, l in enumerate(open(os.path.join(d, f"{k}.{ext}")).read().splitlines(), 1):
+            if l.strip():
+                print(f"{i:4}: {l}")
+if not sections:
+    print("\n".join(log[-40:]))
+sys.exit(1 if bad or not sections else 0)
+PY
 }
 
 # What FakeR36S-OS has (glibc, the C++ runtime, SDL2 and SDL2_ttf, Mesa, ALSA, zlib, libpng, freetype, OpenAL)
@@ -302,6 +359,7 @@ case "${1:-all}" in
     libs) libs ;;
     check) check ;;
     smoke) smoke "${2:-}" ;;
+    lima) lima ;;
     fakers36s) build_fakers36s ;;
     all) game; port_o2r; libs; build_fakers36s; check ;;
     *) echo "usage: $0 [game|port|shaders|libs|check|fakers36s]" >&2; exit 1 ;;

@@ -30,6 +30,14 @@ If the ROM is a version Ghostship does not take (it takes the US and Japan N64 v
 
 The game ignores its own buttons while Select is held, so the combos don't make Mario jump or move the camera.
 
+### Save states
+
+Save states are on by default and are **kept on the card**: Select+R1 keeps the state in memory and writes it to `HOME/.config/sm64/states/slot<N>.frstate` in the background, the 5-second autosave is written to the card every 30 seconds and when you quit, and after a restart Select+L1 or Select+X reads them back. A state only loads into the same build of the game that wrote it (and with the same `sm64.o2r`), so after an update older states are refused rather than risking a crash. The game's own saves (the castle's save files) work as usual next to them.
+
+How it works (the same idea as FakeR36S-Ocarina's [persistent save states](https://github.com/Eeman1113/FakeR36S-Ocarina/blob/main/docs/persistent-savestates.md)): a state is a copy of the game's memory, every variable of the decompiled game (gathered into one range at link time by `fakers36s-state.ld`) plus the used parts of the main pool, and loading one is a copy back, between two frames. The game is linked non-PIE, so all of that is at the same address on every run. The only pointers that move between runs are those into assets loaded from the `.o2r`; libultraship records which memory each asset is built in, so those are written to the card as (asset, block, offset) and rebuilt after a restart. The game log (`HOME/logs/sm64.log`) says how many pointers each written and read state had (`[FakeR36S] state ...`).
+
+To turn them off, or change the autosave, edit `HOME/.config/sm64/ghostship.cfg.json`: `gFakeR36S.SaveStates` (1 or 0), `gFakeR36S.Autosave` (seconds, 0 = off), `gFakeR36S.DiskAutosave` (seconds, 0 = never to the card), `gFakeR36S.StatesToCard` (1 or 0).
+
 ## Building
 
 Everything is built in GitHub Actions (`.github/workflows/build.yml`) on every push to `main`; a tag like `v0.1.0` publishes the zip as that release, with `RELEASE.md` as its notes. Locally, on a PC with Docker:
