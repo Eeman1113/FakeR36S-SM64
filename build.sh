@@ -169,12 +169,21 @@ lima() {
     rm -rf "$d"; mkdir -p "$d"
     "$BLD/shadercheck-lima/shadercheck" "$SRC/libultraship/src/fast/shaders/opengl/gles2.shader.glsl" "$d"
     n=$(ls "$d"/*.vert | wc -l)
+    [ "$n" -le "${LIMA_PROGRAMS:-600}" ] || n=${LIMA_PROGRAMS:-600}
     gcc -O1 -Wall -I$m/include "$HERE/tools/limacheck/limacheck.c" -L"$lib" -Wl,-rpath,"$lib" -lEGL -lGLESv2 -lgbm \
         -o "$BLD/limacheck"
+    mkdir -p /repo/out/lima
+    # lima's own messages go to stderr, interleaved with the "== NNNN" markers; a time limit in case one hangs
     LD_LIBRARY_PATH=$lib:$(dirname "$(find $m -name 'libgallium*.so' | head -1)") \
     LD_PRELOAD=$m/liblima_noop_drm_shim.so LIMA_DEBUG=shaderdb,precompile LIBGL_DRIVERS_PATH=$lib/dri \
-        GBM_BACKENDS_PATH=$lib/gbm "$BLD/limacheck" "$d" "$n" > "$d/lima.log" 2>&1 || true
-    mkdir -p /repo/out/lima
+        GBM_BACKENDS_PATH=$lib/gbm timeout 2400 stdbuf -oL -eL "$BLD/limacheck" "$d" "$n" > "$d/lima.log" 2>&1 &
+    local pid=$!
+    while kill -0 $pid 2>/dev/null; do
+        sleep 60
+        echo "lima: $(grep -c '^== [0-9]' "$d/lima.log") of $n programs, $(grep -c 'shader:' "$d/lima.log") shader stats"
+        cp "$d/lima.log" /repo/out/lima/
+    done
+    wait $pid || echo "limacheck ended with $?"
     cp "$d/lima.log" /repo/out/lima/
     python3 - "$d" <<'PY'
 import re, sys, os
