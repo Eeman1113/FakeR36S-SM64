@@ -1,0 +1,412 @@
+diff --git a/src/port/Engine.cpp b/src/port/Engine.cpp
+index 339b54b..c560360 100644
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -37,6 +37,7 @@
+ 
+ #if defined(__linux__) && !defined(__ANDROID__) && !defined(__SWITCH__)
+ #include <dlfcn.h>
++#include <chrono>
+ #endif
+ 
+ #include <cstdlib>
+@@ -644,7 +645,18 @@ void GameEngine::FinishInit() {
+     CALL_EVENT(EngineReady);
+ }
+ 
++#ifdef FAKER36S
++// FakeR36S: crash and quit evidence, quits held back while extracting (FrCrash.cpp)
++extern "C" void FrCrash_Install(void);
++extern "C" void FrCrash_SetExtracting(int on);
++extern "C" int FrCrash_QuitAsked(void);
++#endif
++
+ void GameEngine::RunExtract(int argc, char* argv[]) {
++#ifdef FAKER36S
++    FrCrash_Install();
++    SPDLOG_INFO("[FakeR36S] startup: engine created, checking the game's archive");
++#endif
+     bool extractDone = false;
+     ExtractSteps extractStep = ES_PORT_ARCHIVE;
+     WindowsSteps windowsStep = WS_TEMP;
+@@ -736,6 +748,41 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+     }
+ #endif
+     std::shared_ptr<BS::thread_pool> threadPool = std::make_shared<BS::thread_pool>(1);
++    // The ROM given on the command line, made into sm64.o2r. Upstream runs Torch twice, a first pass only to count
++    // the assets for the progress bar: on FakeR36S one pass (half the time on the A23), Torch's line per asset off
++    // (it wrote 30 MB of log to the SD card), and every step and its outcome logged.
++    auto FrExtract = [&]() {
++#ifdef FAKER36S
++        FrCrash_SetExtracting(1);
++        const auto level = spdlog::default_logger()->level();
++        SPDLOG_WARN("[FakeR36S] extraction of {} started (one Torch pass, per-asset log off)", file);
++        spdlog::set_level(spdlog::level::warn);
++        const auto t0 = std::chrono::steady_clock::now();
++        bool ok = false;
++        try {
++            ok = extract.GenerateOTR(extractCount, "sm64");
++        } catch (const std::exception& e) {
++            GameExtractor::sLastError = e.what();
++            SPDLOG_ERROR("[FakeR36S] extraction threw: {}", e.what());
++        }
++        const auto secs = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now() - t0).count();
++        spdlog::set_level(level);
++        const std::string o2r = Ship::Context::GetAppDirectoryPath("sm64") + "/sm64.o2r";
++        std::error_code ec;
++        const auto size = std::filesystem::file_size(o2r, ec);
++        if (ok && !ec) {
++            SPDLOG_WARN("[FakeR36S] extraction done in {} s, {} assets: {} written, {} bytes", secs,
++                        extractCount.load(), o2r, size);
++        } else {
++            SPDLOG_ERROR("[FakeR36S] extraction FAILED after {} s ({} assets, Torch {}): {} {}", secs,
++                         extractCount.load(), ok ? "ok" : "failed", o2r, ec ? "is missing" : "exists");
++        }
++        FrCrash_SetExtracting(0);
++#else
++        extract.Parse(totalExtract, "sm64");
++        extract.GenerateOTR(extractCount, "sm64");
++#endif
++    };
+     while (true) {
+ #ifdef USE_NETWORKING
+         auto satellaPhase = Satella::Client::Instance().GetPhase();
+@@ -904,8 +951,7 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                             [&]() {
+                                 extracting = true;
+                                 threadPool->submit_task([&]() -> void {
+-                                    extract.Parse(totalExtract, "sm64");
+-                                    extract.GenerateOTR(extractCount, "sm64");
++                                    FrExtract();
+                                     extracting = false;
+                                     extractCount = totalExtract = 0;
+                                     // Ghostship consumes a single sm64.o2r, so one archive is all we
+@@ -923,8 +969,7 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                     } else {
+                         extracting = true;
+                         threadPool->submit_task([&]() -> void {
+-                            extract.Parse(totalExtract, "sm64");
+-                            extract.GenerateOTR(extractCount, "sm64");
++                            FrExtract();
+                             extracting = false;
+                             extractCount = totalExtract = 0;
+                             // One sm64.o2r generated — done. Don't overwrite it with other ROM versions.
+@@ -1052,6 +1097,13 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                     std::filesystem::exists(Ship::Context::LocateFileAcrossAppDirs("sm64.o2r", "sm64"));
+ 
+                 if (!romO2RExists) {
++#ifdef FAKER36S
++                    // the launcher shows the error (the gamepad can't answer Ghostship's popup)
++                    SPDLOG_ERROR("[FakeR36S] no sm64.o2r after the extraction: {}; exiting with 3",
++                                 GameExtractor::sLastError.empty() ? "no reason given" : GameExtractor::sLastError);
++                    spdlog::default_logger()->flush();
++                    _exit(3);
++#endif
+                     if (GhostshipGui::PopupsQueued() == 0) {
+                         std::string errorMsg;
+                         if (!GameExtractor::sLastError.empty()) {
+@@ -1082,6 +1134,9 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                     continue;
+                 }
+ 
++#ifdef FAKER36S
++                SPDLOG_INFO("[FakeR36S] startup: sm64.o2r found, loading the game");
++#endif
+                 extractStep = GS_COMPILE;
+                 continue;
+             }
+@@ -1131,6 +1186,21 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+         }
+ 
+     render:
++#ifdef FAKER36S
++        if (FrCrash_QuitAsked() && !extracting) {
++            if (extractDone || std::filesystem::exists(Ship::Context::GetAppDirectoryPath("sm64") + "/sm64.o2r")) {
++                SPDLOG_WARN("[FakeR36S] quit asked during the first start: sm64.o2r is ready, exiting");
++            } else {
++                SPDLOG_WARN("[FakeR36S] quit asked during the first start, exiting");
++            }
++            spdlog::default_logger()->flush();
++            _exit(0);
++        }
++        if (!WindowIsRunning()) {
++            SPDLOG_WARN("[FakeR36S] the window closed during the first start{}, exiting",
++                        extracting ? " (while extracting: sm64.o2r is not complete)" : "");
++        }
++#endif
+         if (!WindowIsRunning()) {
+             threadPool = nullptr;
+             gsFast3dWindow = nullptr;
+@@ -1233,7 +1303,12 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                 } else if (counting) {
+                     ImGui::Text("Extracting %s...", filename.c_str());
+                     // Live per-asset feedback (truncated to fit), like Lighthouse.
++#ifdef FAKER36S
++                    // FakeR36S: not read here, Torch's thread writes it meanwhile (a data race on a std::string)
++                    if (false) {
++#else
+                     if (Companion::Instance != nullptr && !Companion::Instance->GetCurrentAssetName().empty()) {
++#endif
+                         std::string assetName = Companion::Instance->GetCurrentAssetName();
+                         const float maxWidth = 600.0f - ImGui::GetStyle().WindowPadding.x * 2.0f;
+                         if (ImGui::CalcTextSize(assetName.c_str()).x > maxWidth) {
+@@ -1249,6 +1324,13 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+                     } else {
+                         ImGui::TextDisabled(" ");
+                     }
++#ifdef FAKER36S
++                } else if (extractCount > 0) {
++                    // one pass, so no total: how far it has got
++                    ImGui::Text("Making the game's files from %s", filename.c_str());
++                    ImGui::TextDisabled("Only the first time: about 2 to 4 minutes on this handheld.");
++                    ImGui::TextDisabled("Select+Start waits until it is done.");
++#endif
+                 } else {
+                     ImGui::Text("Reading %s...", filename.c_str());
+                     ImGui::TextDisabled("Please wait, this can take a moment.");
+@@ -1256,7 +1338,9 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+ 
+                 // Progress bar
+                 std::string overlay =
+-                    counting ? fmt::format("{:.0f}%", progress) : (std::string) "Reading ROM, please wait...";
++                    counting ? fmt::format("{:.0f}%", progress)
++                             : (extractCount > 0 ? fmt::format("{} files done", extractCount.load())
++                                                 : (std::string) "Reading ROM, please wait...");
+                 ImGui::ProgressBar(counting ? progress / 100.0f : -1.0f * (float)ImGui::GetTime(),
+                                    ImVec2(600.0f, 50.0f), overlay.c_str());
+                 ImGui::EndPopup();
+diff --git a/src/port/FrCrash.cpp b/src/port/FrCrash.cpp
+new file mode 100644
+index 0000000..2a6ab7a
+--- /dev/null
++++ b/src/port/FrCrash.cpp
+@@ -0,0 +1,173 @@
++// FakeR36S-SM64: evidence when the game ends. libultraship's own handlers exit(1) without a word on SIGTERM, SIGINT
++// and SIGQUIT, and its crash report needs a live context (it is gone once the game started shutting down, and then it
++// exits(1) without a word too). These replace them:
++//   SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT: the signal, the faulting address, the thread and a backtrace straight to
++//     stderr (HOME/logs/sm64.log, through the launcher) and to HOME/.config/sm64/logs/crash.log, then the default
++//     action, so the launcher sees 128 + the signal (139 SIGSEGV, 132 SIGILL...).
++//   SIGTERM, SIGINT, SIGQUIT, SIGHUP: logged with the sender's pid and command line. While the ROM is being extracted
++//     they wait until it is done (sm64.o2r is kept); otherwise the game quits the clean way (FrSaveStates).
++// Only async-signal-safe calls in the handlers (write, open, read, backtrace_symbols_fd after a first backtrace()).
++#ifdef FAKER36S
++
++#include <execinfo.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/syscall.h>
++#include <unistd.h>
++
++#include <atomic>
++#include <string>
++
++#include <spdlog/spdlog.h>
++#include <ship/Context.h>
++
++static volatile sig_atomic_t sExtracting = 0;
++static volatile sig_atomic_t sQuitAsked = 0;
++static int sCrashFd = -1;
++static char sAltStack[64 * 1024];
++
++static void Out(const char* s) {
++    const size_t n = strlen(s);
++    if (write(2, s, n) < 0) {
++    }
++    if (sCrashFd >= 0 && write(sCrashFd, s, n) < 0) {
++    }
++}
++
++static void OutNum(const char* label, uintptr_t v, bool hex) {
++    char buf[64];
++    char digits[24];
++    int n = 0;
++    const unsigned base = hex ? 16 : 10;
++    do {
++        digits[n++] = "0123456789abcdef"[v % base];
++        v /= base;
++    } while (v != 0 && n < (int)sizeof(digits));
++    size_t p = 0;
++    for (const char* l = label; *l && p < sizeof(buf) - 30; l++) buf[p++] = *l;
++    if (hex) {
++        buf[p++] = '0';
++        buf[p++] = 'x';
++    }
++    while (n > 0) buf[p++] = digits[--n];
++    buf[p] = 0;
++    Out(buf);
++}
++
++static const char* Name(int sig) {
++    switch (sig) {
++        case SIGSEGV: return "SIGSEGV (invalid memory access)";
++        case SIGBUS: return "SIGBUS (bus error)";
++        case SIGILL: return "SIGILL (illegal instruction)";
++        case SIGFPE: return "SIGFPE (arithmetic error)";
++        case SIGABRT: return "SIGABRT (abort)";
++        case SIGTERM: return "SIGTERM";
++        case SIGINT: return "SIGINT";
++        case SIGQUIT: return "SIGQUIT";
++        case SIGHUP: return "SIGHUP";
++        default: return "signal";
++    }
++}
++
++static void Fatal(int sig, siginfo_t* info, void*) {
++    Out("\n[FakeR36S] CRASH: ");
++    Out(Name(sig));
++    OutNum(", signal ", (uintptr_t)sig, false);
++    OutNum(", address ", (uintptr_t)(info != nullptr ? info->si_addr : nullptr), true);
++    OutNum(", code ", (uintptr_t)(info != nullptr ? info->si_code : 0), false);
++    OutNum(", thread ", (uintptr_t)syscall(SYS_gettid), false);
++    OutNum(" of process ", (uintptr_t)getpid(), false);
++    Out(sExtracting ? ", while extracting the ROM\n" : "\n");
++    void* frames[64];
++    const int n = backtrace(frames, 64);
++    Out("[FakeR36S] backtrace (addresses in the Ghostship binary: arm-linux-gnueabihf-addr2line -e Ghostship):\n");
++    backtrace_symbols_fd(frames, n, 2);
++    if (sCrashFd >= 0) backtrace_symbols_fd(frames, n, sCrashFd);
++    Out("[FakeR36S] end of crash report\n");
++    if (sCrashFd >= 0) fsync(sCrashFd);
++    signal(sig, SIG_DFL);
++    raise(sig);
++}
++
++static void Quit(int sig, siginfo_t* info, void*) {
++    const pid_t from = info != nullptr ? info->si_pid : 0;
++    Out("\n[FakeR36S] ");
++    Out(Name(sig));
++    OutNum(" received from pid ", (uintptr_t)from, false);
++    if (from > 0) {
++        char path[48] = "/proc/";
++        char num[16];
++        int n = 0;
++        pid_t v = from;
++        do {
++            num[n++] = '0' + v % 10;
++            v /= 10;
++        } while (v != 0);
++        size_t p = strlen(path);
++        while (n > 0) path[p++] = num[--n];
++        memcpy(path + p, "/cmdline", 9);
++        int fd = open(path, O_RDONLY);
++        if (fd >= 0) {
++            char cmd[200];
++            ssize_t r = read(fd, cmd, sizeof(cmd) - 1);
++            close(fd);
++            if (r > 0) {
++                for (ssize_t i = 0; i < r; i++) {
++                    if (cmd[i] == 0) cmd[i] = ' ';
++                }
++                cmd[r] = 0;
++                Out(" (");
++                Out(cmd);
++                Out(")");
++            }
++        }
++    }
++    if (sExtracting) {
++        Out(": the ROM is being extracted, the game quits once sm64.o2r is written\n");
++    } else {
++        Out(": quitting\n");
++    }
++    sQuitAsked = 1;
++}
++
++extern "C" void FrCrash_Install(void) {
++    // the first backtrace() loads libgcc_s, which is not safe from inside a signal handler
++    void* warm[2];
++    backtrace(warm, 2);
++    if (sCrashFd < 0) {
++        const std::string dir = Ship::Context::GetPathRelativeToAppDirectory("logs", "sm64");
++        sCrashFd = open((dir + "/crash.log").c_str(), O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
++    }
++    stack_t ss = {};
++    ss.ss_sp = sAltStack;
++    ss.ss_size = sizeof(sAltStack);
++    sigaltstack(&ss, nullptr); // the main thread's own stack may be what overflowed
++
++    struct sigaction fatal = {};
++    fatal.sa_sigaction = Fatal;
++    fatal.sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESETHAND;
++    sigemptyset(&fatal.sa_mask);
++    for (int s : { SIGSEGV, SIGBUS, SIGILL, SIGFPE, SIGABRT }) sigaction(s, &fatal, nullptr);
++
++    struct sigaction quit = {};
++    quit.sa_sigaction = Quit;
++    quit.sa_flags = SA_SIGINFO | SA_RESTART;
++    sigemptyset(&quit.sa_mask);
++    for (int s : { SIGTERM, SIGINT, SIGQUIT, SIGHUP }) sigaction(s, &quit, nullptr);
++
++    spdlog::flush_on(spdlog::level::trace); // nothing waits in a buffer when the game ends
++}
++
++extern "C" void FrCrash_SetExtracting(int on) {
++    sExtracting = on ? 1 : 0;
++}
++
++extern "C" int FrCrash_QuitAsked(void) {
++    return sQuitAsked != 0;
++}
++
++#endif // FAKER36S
+diff --git a/src/port/FrSaveStates.cpp b/src/port/FrSaveStates.cpp
+index 112c4e9..be4be4f 100644
+--- a/src/port/FrSaveStates.cpp
++++ b/src/port/FrSaveStates.cpp
+@@ -708,6 +708,8 @@ static void WaitIdle(uint32_t ms) {
+ #define FR_RESUME_SLOT 10 // the previous run's autosave, set aside at start (the first Select+X loads it)
+ #define FR_INPUT_BLOCK 0x4652 // ControlDeck block id while Select is held
+ 
++extern "C" int FrCrash_QuitAsked(void);
++
+ static std::map<unsigned, std::shared_ptr<frstate::State>> sStates;
+ static unsigned sSlot = 0;
+ static uint32_t sFrames = 0;
+@@ -755,8 +757,18 @@ extern "C" void FrSaveStates_Frame(void) {
+     static uint32_t held = 0;         // buttons down last frame, for edge detection
+     static uint32_t lastAutosave = 0; // SDL ticks
+     static uint32_t lastDisk = 0;
+-    static bool resumeChecked = false, resumeAvailable = false, blocked = false;
++    static bool resumeChecked = false, resumeAvailable = false, blocked = false, quitPushed = false;
+     sFrames++;
++    if (sFrames == 1 || sFrames == 300) {
++        SPDLOG_INFO("[FakeR36S] startup: game frame {} reached", sFrames);
++    }
++    // SIGTERM and friends (fr-padwatch's Select+Start, the power menu): the clean quit, autosave included
++    if (FrCrash_QuitAsked() && !quitPushed) {
++        quitPushed = true;
++        SDL_Event e = {};
++        e.type = SDL_QUIT;
++        SDL_PushEvent(&e);
++    }
+ 
+     // Once per run, before this run writes any autosave: the last run's autosave becomes the resume state, so the
+     // new session's rolling autosave can't overwrite it.
+@@ -848,6 +860,8 @@ extern "C" void FrSaveStates_Frame(void) {
+ 
+ // The game loop has ended (Select+Start, the menu, fr-padwatch's SIGTERM): keep the moment you quit
+ extern "C" void FrSaveStates_Quit(void) {
++    SPDLOG_INFO("[FakeR36S] the game loop ended after {} frames{}", sFrames,
++                FrCrash_QuitAsked() ? " (a quit signal)" : "");
+     if (!FR_Enabled() || CVarGetInteger("gFakeR36S.Autosave", 5) <= 0) {
+         frdisk::WaitIdle(8000);
+         return;
+diff --git a/src/port/GameExtractor.cpp b/src/port/GameExtractor.cpp
+index 88c7e5d..3c0a656 100644
+--- a/src/port/GameExtractor.cpp
++++ b/src/port/GameExtractor.cpp
+@@ -350,7 +350,8 @@ bool GameExtractor::GenerateOTRTo(std::atomic<size_t>& assetCount, const std::st
+     try {
+         Companion::Instance->Init(ExportType::Binary, assetCount, true);
+     } catch (const std::exception& e) {
+-        SPDLOG_INFO("Failed to process O2R {}", e.what());
++        sLastError = e.what();
++        SPDLOG_ERROR("Failed to process O2R {}", e.what());
+         return false;
+     }
+ 

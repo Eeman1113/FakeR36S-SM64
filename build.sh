@@ -363,9 +363,12 @@ smoke() {
         kill -0 $game 2>/dev/null || { echo "Ghostship exited before ${t}s"; alive=0; break; }
         DISPLAY=:9 import -window root "$shots/t$t.png"
     done
-    kill $game 2>/dev/null || true
-    sleep 2
+    # a quit request must be logged and end the game cleanly (FrCrash.cpp)
+    kill -TERM $game 2>/dev/null || true
+    for ((t = 0; t < 20; t++)); do kill -0 $game 2>/dev/null || break; sleep 1; done
+    kill -0 $game 2>/dev/null && { echo "Ghostship ignored SIGTERM"; alive=0; }
     kill -9 $game 2>/dev/null || true
+    grep -q "SIGTERM received from pid" "$shots/stdout.log" || { echo "no SIGTERM line in the log"; alive=0; }
     kill $xvfb 2>/dev/null || true
     cp "$run/home/logs/"*.log "$shots/" 2>/dev/null || true
     tail -n 40 "$shots/stdout.log"

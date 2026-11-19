@@ -79,21 +79,49 @@ find_rom() {
     return 1
 }
 
+# What an exit status means, for the log
+exit_reason() {
+    case $1 in
+        0) echo "clean exit" ;;
+        1) echo "error exit" ;;
+        3) echo "the ROM extraction failed (see the [FakeR36S] lines above)" ;;
+        127) echo "the game could not be started (missing file or library)" ;;
+        130) echo "killed by SIGINT" ;;
+        132) echo "SIGILL: illegal instruction (an ARMv8 instruction on the ARMv7 A23?)" ;;
+        134) echo "SIGABRT: abort" ;;
+        135) echo "SIGBUS: bus error" ;;
+        136) echo "SIGFPE: arithmetic error" ;;
+        137) echo "SIGKILL: killed (out of memory, or fr-padwatch 5 s after Select+Start)" ;;
+        139) echo "SIGSEGV: crash (invalid memory access)" ;;
+        143) echo "SIGTERM" ;;
+        *) [ "$1" -gt 128 ] 2>/dev/null && echo "killed by signal $(($1 - 128))" || echo "exit status $1" ;;
+    esac
+}
+
 # The game, its output in the log; arguments go to it (a ROM to extract). Select+Start closes it (fr-padwatch, and
-# the game's own hotkey); the game writes its autosave state on the way out.
+# the game's own hotkey); the game writes its autosave state on the way out. Not during the first start's
+# extraction: fr-padwatch would kill it 5 s after Select+Start, losing sm64.o2r (the game holds a quit until the
+# extraction is done, and says so on screen).
 play() {
     [ -f "$data/$CONFIG" ] || cp "$app/defaults.json" "$data/$CONFIG"
     [ -f "$data/env" ] && { set -a; . "$data/env"; set +a; }
-    [ "$(wc -c < "$log" 2>/dev/null || echo 0)" -gt 2000000 ] && : > "$log"
+    # the previous run's log is kept as sm64.prev.log, so a crash's evidence survives one relaunch
+    [ -f "$log" ] && mv -f "$log" "${log%.log}.prev.log"
     _watch=
-    [ -x /usr/bin/fr-padwatch ] && _watch=/usr/bin/fr-padwatch
+    [ $# -eq 0 ] && [ -x /usr/bin/fr-padwatch ] && _watch=/usr/bin/fr-padwatch
     {
-        echo "=== $PORT start $(date)"
+        echo "=== $PORT start $(date)${1:+, extracting $1}"
         grep -E "MemTotal|MemAvailable|SwapFree" /proc/meminfo
+        df -k "$HOME" 2>/dev/null | tail -n 1
         cd "$app" && $_watch "./$ELF" "$@"
-        echo "=== exit $?"
+        _rc=$?
+        echo "=== exit $_rc: $(exit_reason $_rc)"
         grep -E "MemAvailable|SwapFree" /proc/meminfo
+        ls -l "$data/$O2R" 2>/dev/null || echo "no $data/$O2R"
+        echo "$_rc" > "$data/.last-exit"
     } >> "$log" 2>&1
+    sync
+    return "$(cat "$data/.last-exit" 2>/dev/null || echo 1)"
 }
 
 start() {
@@ -123,5 +151,9 @@ start() {
     fi
     echo "$(date '+%F %T') extracting $_file${_entry:+ ($_entry)} ($_order)" >> "$HOME/logs/$PORT-import.log"
     play "$_rom"
+    _rc=$?
     rm -f "$data"/rom.z64
+    echo "$(date '+%F %T') exit $_rc: $(exit_reason $_rc); $(ls -l "$data/$O2R" 2>/dev/null || echo "no $O2R")" \
+        >> "$HOME/logs/$PORT-import.log"
+    ready || fail "The game's files could not be made from your ROM ($(exit_reason $_rc)). HOME/logs/sm64.log says why; open the game again to retry."
 }
