@@ -8,6 +8,8 @@
 #   ./build.sh fakers36s   out/FakeR36S-SM64-<version>.zip: ports/sm64 and its menu entry, unzipped into HOME.
 #                          No game in it: the player's ROM is extracted on the console, by the game. APP_VERSION:
 #                          default git describe
+#   ./build.sh smoke [s]   the packaged port under qemu-arm on Xvfb (Mesa llvmpipe, GLES2), with no ROM: it must start,
+#                          make its GLES2 context and draw its first-start window; screenshots in out/smoke
 #   ./build.sh             game, port, libs, check, fakers36s
 # Output in out/sm64. Runs in the fakers36s-sm64 image (Dockerfile), sources and build trees in the sm64-work volume.
 set -euo pipefail
@@ -17,6 +19,10 @@ IMAGE=fakers36s-sm64
 
 if [ ! -f /.dockerenv ]; then
     docker image inspect $IMAGE >/dev/null 2>&1 || docker build -t $IMAGE "$HERE"
+    case " $* " in *" smoke "*)
+        docker image inspect $IMAGE-smoke >/dev/null 2>&1 || docker build -t $IMAGE-smoke -f "$HERE/tools/smoke.Dockerfile" "$HERE/tools"
+        IMAGE=$IMAGE-smoke ;;
+    esac
     exec docker run --rm -i -v "$HERE:/repo" -v sm64-work:/work -e GL_JOBS -e APP_VERSION $IMAGE /repo/build.sh "$@"
 fi
 
@@ -192,6 +198,9 @@ check() {
     arm-linux-gnueabihf-readelf -d "$OUT/$ELF" | sed -n 's/.*Shared library: \[\(.*\)\]/  \1/p'
     echo "== attributes:"
     arm-linux-gnueabihf-readelf -A "$OUT/$ELF" | grep -E 'Tag_CPU_arch|Tag_FP_arch|Tag_Advanced_SIMD|Tag_ABI_VFP_args'
+    echo "== the game's variables for save states (fakers36s-state.ld):"
+    arm-linux-gnueabihf-readelf -SW "$BLD/armhf/$ELF" | grep -E '\.fr_state|\s\.data\s|\s\.bss\s' || true
+    arm-linux-gnueabihf-readelf -SW "$BLD/armhf/$ELF" | grep -q '\.fr_state_bss' || { echo "no .fr_state_bss"; bad=1; }
     echo "== highest GLIBC symbol version: $(arm-linux-gnueabihf-objdump -T "$OUT/$ELF" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
     echo "== highest GLIBCXX: $(arm-linux-gnueabihf-objdump -T "$OUT/$ELF" | grep -o 'GLIBCXX_[0-9.]*' | sort -uV | tail -1)"
     [ $bad = 0 ]
@@ -258,6 +267,33 @@ with zipfile.ZipFile(sys.argv[1], "w", zipfile.ZIP_DEFLATED, compresslevel=9) as
         "$(du -sm "$a" | cut -f1) MB unpacked, $(($(stat -c %s "$zip") / 1048576)) MB zipped"
 }
 
+# The packaged port under qemu-arm on Xvfb, GLES2 on Mesa's llvmpipe, without a ROM: Ghostship starts, opens its
+# GLES2 context, builds its ImGui shaders and waits in its "No O2R files" prompt. A screenshot every 30 s for $1
+# seconds; fails if the game died or never reported its GLES2 renderer.
+smoke() {
+    local secs=${1:-180} run=/tmp/sm64-run shots=/repo/out/smoke t xvfb game alive=1
+    rm -rf "$run" "$shots"; mkdir -p "$run/home" "$shots"
+    cp -r /repo/out/fakers36s/ports/sm64/. "$run/"
+    cp "$run/defaults.json" "$run/home/ghostship.cfg.json"
+    Xvfb :9 -screen 0 640x480x24 -nolisten tcp & xvfb=$!
+    sleep 2
+    (cd "$run" && SHIP_HOME=$run/home DISPLAY=:9 SDL_VIDEODRIVER=x11 SDL_AUDIODRIVER=dummy QEMU_LD_PREFIX=/ \
+        LD_LIBRARY_PATH=$run/libs exec qemu-arm ./Ghostship > "$shots/stdout.log" 2>&1) & game=$!
+    for ((t = 30; t <= secs; t += 30)); do
+        sleep 30
+        kill -0 $game 2>/dev/null || { echo "Ghostship exited before ${t}s"; alive=0; break; }
+        DISPLAY=:9 import -window root "$shots/t$t.png"
+    done
+    kill $game 2>/dev/null || true
+    sleep 2
+    kill -9 $game 2>/dev/null || true
+    kill $xvfb 2>/dev/null || true
+    cp "$run/home/logs/"*.log "$shots/" 2>/dev/null || true
+    tail -n 40 "$shots/stdout.log"
+    ls -l "$shots"
+    [ $alive = 1 ] && grep -q "GLES2: " "$shots"/*.log
+}
+
 source_tree
 case "${1:-all}" in
     game) game ;;
@@ -265,6 +301,7 @@ case "${1:-all}" in
     shaders) shaders ;;
     libs) libs ;;
     check) check ;;
+    smoke) smoke "${2:-}" ;;
     fakers36s) build_fakers36s ;;
     all) game; port_o2r; libs; build_fakers36s; check ;;
     *) echo "usage: $0 [game|port|shaders|libs|check|fakers36s]" >&2; exit 1 ;;
