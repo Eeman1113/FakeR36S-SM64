@@ -1,0 +1,21 @@
+{
+    "CVars": {
+        "gSettings": {
+            "TextureFilter": 1,
+            "InterpolationFPS": 30,
+            "VsyncEnabled": 1,
+            "InternalResolution": 1.0,
+            "MSAAValue": 1,
+            "ControlNav": 0,
+            "OpenMenuBar": 0
+        },
+        "gOpenWindows": {
+            "Stats": 0
+        },
+        "gFakeR36S": {
+            "SaveStates": 1,
+            "Autosave": 5,
+            "DiskAutosave": 30
+        }
+    }
+}

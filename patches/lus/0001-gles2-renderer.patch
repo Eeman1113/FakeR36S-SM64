@@ -1,0 +1,1014 @@
+diff --git a/cmake/dependencies/linux.cmake b/cmake/dependencies/linux.cmake
+index 02301f13..4fe87c7a 100644
+--- a/cmake/dependencies/linux.cmake
++++ b/cmake/dependencies/linux.cmake
+@@ -4,7 +4,11 @@ target_link_libraries(ImGui PUBLIC SDL2::SDL2)
+ 
+ if (USE_OPENGLES)
+     target_link_libraries(ImGui PUBLIC ${OPENGL_GLESv2_LIBRARY})
+-    add_compile_definitions(IMGUI_IMPL_OPENGL_ES3)
++    if (USE_GLES2)
++        add_compile_definitions(IMGUI_IMPL_OPENGL_ES2)
++    else()
++        add_compile_definitions(IMGUI_IMPL_OPENGL_ES3)
++    endif()
+ else()
+     target_link_libraries(ImGui PUBLIC ${OPENGL_opengl_LIBRARY})
+ endif()
+diff --git a/include/fast/backends/gfx_opengl.h b/include/fast/backends/gfx_opengl.h
+index 5d9a0089..96a57035 100644
+--- a/include/fast/backends/gfx_opengl.h
++++ b/include/fast/backends/gfx_opengl.h
+@@ -22,6 +22,10 @@ class ResourceManager;
+ #elif __APPLE__
+ #include <SDL2/SDL.h>
+ #include <GL/glew.h>
++#elif defined(USE_GLES2)
++#include <SDL2/SDL.h>
++#include <GLES2/gl2.h>
++#include <GLES2/gl2ext.h>
+ #elif USE_OPENGLES
+ #include <SDL2/SDL.h>
+ #include <GLES3/gl3.h>
+@@ -146,6 +150,16 @@ class GfxRenderingAPIOGL final : public GfxRenderingAPI {
+     void SetUniforms(ShaderProgram* prg) const;
+     std::string BuildFsShader(const CCFeatures& cc_features);
+     void SetPerDrawUniforms();
++#ifdef USE_GLES2
++    void DrawTextureToFramebuffer(GLuint tex, int texW, int texH, int srcX0, int srcY0, int srcX1, int srcY1,
++                                  const FramebufferOGL& dst, int dstX0, int dstY0, int dstX1, int dstY1);
++
++    GLuint mBlitProgram = 0;
++    GLint mBlitPosLocation = -1;
++    GLint mBlitUvLocation = -1;
++    GLuint mBlitTmpTexture = 0;
++    GLenum mDepthFormat = GL_DEPTH_COMPONENT16;
++#endif
+ 
+     std::shared_ptr<Ship::ConsoleVariable> mConsoleVariable;
+     std::shared_ptr<Ship::ResourceManager> mResourceManager;
+diff --git a/src/CMakeLists.txt b/src/CMakeLists.txt
+index 703dcf65..fbaab656 100644
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -9,6 +9,7 @@ set_target_properties(libultraship PROPERTIES ENABLE_EXPORTS TRUE)
+ set_target_properties(libultraship PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS TRUE)
+ set(INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/../include)
+ option(USE_OPENGLES "Enable GLES3" OFF)
++option(USE_GLES2 "With USE_OPENGLES, target GLES2 instead of GLES3" OFF)
+ option(GFX_DEBUG_DISASSEMBLER "Enable libgfxd" OFF)
+ 
+ if (CMAKE_SYSTEM_NAME STREQUAL "Windows")
+@@ -272,6 +273,7 @@ else()
+         $<$<NOT:$<CONFIG:Debug>>:NDEBUG>
+         SPDLOG_ACTIVE_LEVEL=${SPDLOG_MIN_CUTOFF}
+         $<$<BOOL:${USE_OPENGLES}>:USE_OPENGLES>
++        $<$<BOOL:${USE_GLES2}>:USE_GLES2>
+         $<$<BOOL:${GFX_DEBUG_DISASSEMBLER}>:GFX_DEBUG_DISASSEMBLER>
+     )
+ endif()
+diff --git a/src/fast/Fast3dGui.cpp b/src/fast/Fast3dGui.cpp
+index 4490c7a2..34c65c9c 100644
+--- a/src/fast/Fast3dGui.cpp
++++ b/src/fast/Fast3dGui.cpp
+@@ -235,6 +235,8 @@ void Fast3dGui::ImGuiBackendInit() {
+         case WindowBackend::FAST3D_SDL_OPENGL:
+ #ifdef __APPLE__
+             ImGui_ImplOpenGL3_Init("#version 410 core");
++#elif defined(USE_GLES2)
++            ImGui_ImplOpenGL3_Init("#version 100");
+ #elif USE_OPENGLES
+             ImGui_ImplOpenGL3_Init("#version 300 es");
+ #else
+diff --git a/src/fast/Fast3dWindow.cpp b/src/fast/Fast3dWindow.cpp
+index a9e66517..ec4c06e9 100644
+--- a/src/fast/Fast3dWindow.cpp
++++ b/src/fast/Fast3dWindow.cpp
+@@ -137,7 +137,13 @@ void Fast3dWindow::OnInit(const nlohmann::json& initArgs) {
+     mWindowManagerApi->SetKeyboardCallbacks(KeyDown, KeyUp, AllKeysUp);
+     mWindowManagerApi->SetMouseCallbacks(MouseButtonDown, MouseButtonUp);
+ 
+-    SetTextureFilter((FilteringMode)GetConsoleVariables()->GetInteger(CVAR_TEXTURE_FILTER, FILTER_THREE_POINT));
++#ifdef USE_GLES2
++    // Three-point filtering samples every texture three times: too much for GLES2-class GPUs
++    const FilteringMode defaultFilter = FILTER_LINEAR;
++#else
++    const FilteringMode defaultFilter = FILTER_THREE_POINT;
++#endif
++    SetTextureFilter((FilteringMode)GetConsoleVariables()->GetInteger(CVAR_TEXTURE_FILTER, defaultFilter));
+ 
+     // Register the GFX Debugger window if not already present.
+     if (GetGui() && GetGui()->GetGuiWindow("Gfx Debugger") == nullptr) {
+diff --git a/src/fast/backends/gfx_opengl.cpp b/src/fast/backends/gfx_opengl.cpp
+index 6e0adc7c..1430e05d 100644
+--- a/src/fast/backends/gfx_opengl.cpp
++++ b/src/fast/backends/gfx_opengl.cpp
+@@ -4,6 +4,7 @@
+ #include <stdint.h>
+ #include <stdbool.h>
+ #include <stdio.h>
++#include <string.h>
+ 
+ #include <map>
+ #include <unordered_map>
+@@ -26,6 +27,12 @@
+ #include "fast/interpreter.h"
+ #include "ship/config/ConsoleVariable.h"
+ 
++#ifdef USE_GLES2
++// GLES2 takes unsized texture formats
++#define GL_RGBA8 GL_RGBA
++#define GL_RGB8 GL_RGB
++#endif
++
+ namespace Fast {
+ 
+ // Cached for free-function include-loader callbacks passed to the prism processor via a raw
+@@ -386,6 +393,11 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
+         { "SHADER_NOISE", SHADER_NOISE },
+         { "o_three_point_filtering", mCurrentFilterMode == FILTER_THREE_POINT },
+         { "append_formula", (InvokeFunc)append_formula },
++#ifdef USE_GLES2
++        { "gles2", true },
++#else
++        { "gles2", false },
++#endif
+ #ifdef __APPLE__
+         { "GLSL_VERSION", "#version 410 core" },
+         { "attr", "in" },
+@@ -393,6 +405,13 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
+         { "core_opengl", true },
+         { "texture", "texture" },
+         { "vOutColor", "vOutColor" },
++#elif defined(USE_GLES2)
++        { "GLSL_VERSION", "#version 100\nprecision mediump float;" },
++        { "attr", "varying" },
++        { "opengles", true },
++        { "core_opengl", false },
++        { "texture", "texture2D" },
++        { "vOutColor", "gl_FragColor" },
+ #elif defined(USE_OPENGLES)
+ #ifdef __EMSCRIPTEN__
+         { "GLSL_VERSION", "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;" },
+@@ -423,7 +442,13 @@ std::string GfxRenderingAPIOGL::BuildFsShader(const CCFeatures& cc_features) {
+     init->ByteOrder = Ship::Endianness::Native;
+     init->Format = RESOURCE_FORMAT_BINARY;
+     const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
++#ifdef USE_GLES2
++    // GLSL ES 1.00: one shader of its own (custom shaders are written for GLSL 3)
++    std::string path = "shaders/opengl/gles2.shader.glsl";
++    shaderName = nullptr;
++#else
+     std::string path = "shaders/opengl/default.shader.glsl";
++#endif
+ 
+     if (nullptr != shaderName) {
+         path = std::string(shaderName) + ".glsl";
+@@ -476,11 +501,21 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
+                                      { "o_texgen", cc_features.opt_texgen },
+                                      { "o_texgen_linear", cc_features.opt_texgen_linear },
+                                      { "update_floats", (InvokeFunc)UpdateFloats },
++#ifdef USE_GLES2
++                                     { "gles2", true },
++#else
++                                     { "gles2", false },
++#endif
+ #ifdef __APPLE__
+                                      { "GLSL_VERSION", "#version 410 core" },
+                                      { "attr", "in" },
+                                      { "out", "out" },
+                                      { "opengles", false }
++#elif defined(USE_GLES2)
++                                     { "GLSL_VERSION", "#version 100" },
++                                     { "attr", "attribute" },
++                                     { "out", "varying" },
++                                     { "opengles", true }
+ #elif defined(USE_OPENGLES)
+                                      { "GLSL_VERSION", "#version 300 es" },
+                                      { "attr", "in" },
+@@ -504,7 +539,13 @@ static std::string BuildVsShader(const CCFeatures& cc_features) {
+     init->ByteOrder = Ship::Endianness::Native;
+     init->Format = RESOURCE_FORMAT_BINARY;
+     const char* shaderName = Fast::gfx_get_shader(cc_features.shader_id);
++#ifdef USE_GLES2
++    // GLSL ES 1.00: one shader of its own (custom shaders are written for GLSL 3)
++    std::string path = "shaders/opengl/gles2.shader.glsl";
++    shaderName = nullptr;
++#else
+     std::string path = "shaders/opengl/default.shader.glsl";
++#endif
+ 
+     if (nullptr != shaderName) {
+         path = std::string(shaderName) + ".glsl";
+@@ -549,9 +590,9 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
+         GLint max_length = 0;
+         glGetShaderiv(vertex_shader, GL_INFO_LOG_LENGTH, &max_length);
+         char error_log[1024];
+-        // fprintf(stderr, "Vertex shader compilation failed\n");
+-        glGetShaderInfoLog(vertex_shader, max_length, &max_length, &error_log[0]);
+-        // fprintf(stderr, "%s\n", &error_log[0]);
++        fprintf(stderr, "Vertex shader compilation failed\n");
++        glGetShaderInfoLog(vertex_shader, sizeof(error_log), &max_length, &error_log[0]);
++        fprintf(stderr, "%s\n%s\n", &error_log[0], vs_buf.c_str());
+         abort();
+     }
+ 
+@@ -564,8 +605,8 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
+         glGetShaderiv(fragment_shader, GL_INFO_LOG_LENGTH, &max_length);
+         char error_log[1024];
+         fprintf(stderr, "Fragment shader compilation failed\n");
+-        glGetShaderInfoLog(fragment_shader, max_length, &max_length, &error_log[0]);
+-        fprintf(stderr, "%s\n", &error_log[0]);
++        glGetShaderInfoLog(fragment_shader, sizeof(error_log), &max_length, &error_log[0]);
++        fprintf(stderr, "%s\n%s\n", &error_log[0], fs_buf.c_str());
+         abort();
+     }
+ 
+@@ -573,6 +614,13 @@ ShaderProgram* GfxRenderingAPIOGL::CreateAndLoadNewShader(uint64_t shader_id0, u
+     glAttachShader(shader_program, vertex_shader);
+     glAttachShader(shader_program, fragment_shader);
+     glLinkProgram(shader_program);
++    glGetProgramiv(shader_program, GL_LINK_STATUS, &success);
++    if (!success) {
++        char error_log[1024];
++        glGetProgramInfoLog(shader_program, sizeof(error_log), nullptr, &error_log[0]);
++        fprintf(stderr, "Shader program link failed\n%s\n%s\n%s\n", &error_log[0], vs_buf.c_str(), fs_buf.c_str());
++        abort();
++    }
+ 
+     size_t cnt = 0;
+ 
+@@ -722,11 +770,13 @@ void GfxRenderingAPIOGL::UploadTexture(const uint8_t* rgba32_buf, uint32_t width
+     TextureInfo& info = textures[mCurrentTextureIds[mCurrentTile]];
+     info.width = width;
+     info.height = height;
++#ifndef USE_GLES2 // GLES2 textures never hold a mip chain (UploadTextureMip below)
+     if (info.mip_levels > 1) {
+         // Recycled texture id previously held a mip chain; restrict sampling to
+         // the base level so the texture stays complete.
+         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 0);
+     }
++#endif
+     info.mip_levels = 1;
+     info.auto_mipmaps = false;
+ }
+@@ -736,6 +786,14 @@ void GfxRenderingAPIOGL::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t wi
+     if (width == 0 || height == 0) {
+         return;
+     }
++#ifdef USE_GLES2
++    // No GL_TEXTURE_MAX_LEVEL on GLES2 (a partial chain is an incomplete texture), and the
++    // Mali-400 has no fill rate to spare for mip filtering: the base level only.
++    if (level == 0) {
++        UploadTexture(rgba32_buf, width, height);
++    }
++    return;
++#endif
+     glTexImage2D(GL_TEXTURE_2D, level, GL_RGBA8, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, rgba32_buf);
+     if (level == 0) {
+         TextureInfo& info = textures[mCurrentTextureIds[mCurrentTile]];
+@@ -752,7 +810,7 @@ void GfxRenderingAPIOGL::UploadTextureMip(const uint8_t* rgba32_buf, uint32_t wi
+ }
+ 
+ #ifdef USE_OPENGLES
+-// 0x8743 is INVALID_ENUM on ES3/WebGL2; mirrored repeat is the closest valid mode
++// 0x8743 is INVALID_ENUM on ES3/WebGL2 (and GLES2); mirrored repeat is the closest valid mode
+ #define GL_MIRROR_CLAMP_TO_EDGE GL_MIRRORED_REPEAT
+ #endif
+ 
+@@ -793,7 +851,9 @@ void GfxRenderingAPIOGL::SetSamplerParameters(int tile, bool linear_filter, uint
+     }
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, minFilter);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, filter);
+-#ifdef GL_TEXTURE_MAX_ANISOTROPY
++#ifdef USE_GLES2
++    // no anisotropic filtering on GLES2-class GPUs
++#elif defined(GL_TEXTURE_MAX_ANISOTROPY)
+     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY, tex.auto_mipmaps ? 8.0f : 1.0f);
+ #elif defined(GL_TEXTURE_MAX_ANISOTROPY_EXT)
+     glTexParameterf(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, tex.auto_mipmaps ? 8.0f : 1.0f);
+@@ -928,7 +988,7 @@ void GfxRenderingAPIOGL::Init() {
+     glGenBuffers(1, &mOpenglVbo);
+     glBindBuffer(GL_ARRAY_BUFFER, mOpenglVbo);
+ 
+-#if defined(__APPLE__) || defined(USE_OPENGLES)
++#if defined(__APPLE__) || (defined(USE_OPENGLES) && !defined(USE_GLES2))
+     glGenVertexArrays(1, &mOpenglVao);
+     glBindVertexArray(mOpenglVao);
+ #endif
+@@ -941,6 +1001,18 @@ void GfxRenderingAPIOGL::Init() {
+ 
+     mFrameBuffers.resize(1); // for the default screen buffer
+ 
++#ifdef USE_GLES2
++    const char* extensions = (const char*)glGetString(GL_EXTENSIONS);
++    if (extensions != nullptr && strstr(extensions, "GL_OES_packed_depth_stencil") != nullptr) {
++        mDepthFormat = GL_DEPTH24_STENCIL8_OES;
++    } else if (extensions != nullptr && strstr(extensions, "GL_OES_depth24") != nullptr) {
++        mDepthFormat = GL_DEPTH_COMPONENT24_OES;
++    }
++    GLint maxVaryings = 0;
++    glGetIntegerv(GL_MAX_VARYING_VECTORS, &maxVaryings);
++    SPDLOG_INFO("GLES2: {}, {}, depth format 0x{:x}, {} varyings", (const char*)glGetString(GL_RENDERER),
++                (const char*)glGetString(GL_VERSION), mDepthFormat, maxVaryings);
++#else
+     glGenRenderbuffers(1, &mPixelDepthRb);
+     glBindRenderbuffer(GL_RENDERBUFFER, mPixelDepthRb);
+     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
+@@ -954,6 +1026,7 @@ void GfxRenderingAPIOGL::Init() {
+     mPixelDepthRbSize = 1;
+ 
+     glGetIntegerv(GL_MAX_SAMPLES, &mMaxMsaaLevel);
++#endif
+ 
+     sOGLResourceManager = mResourceManager;
+ }
+@@ -979,6 +1052,11 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
+     glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, 1, 1, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+     glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
++#ifdef USE_GLES2
++    // A non-power-of-two texture is incomplete with GL_REPEAT on GLES2
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++#endif
+     glBindTexture(GL_TEXTURE_2D, 0);
+ 
+     GLuint clrbufMsaa;
+@@ -987,7 +1065,11 @@ int GfxRenderingAPIOGL::CreateFramebuffer() {
+     GLuint rbo;
+     glGenRenderbuffers(1, &rbo);
+     glBindRenderbuffer(GL_RENDERBUFFER, rbo);
++#ifdef USE_GLES2
++    glRenderbufferStorage(GL_RENDERBUFFER, mDepthFormat, 1, 1);
++#else
+     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, 1, 1);
++#endif
+     glBindRenderbuffer(GL_RENDERBUFFER, 0);
+ 
+     GLuint fbo;
+@@ -1017,6 +1099,12 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width,
+ 
+     if (fb_id != 0) {
+         if (fb.width != width || fb.height != height || fb.msaa_level != msaa_level) {
++#ifdef USE_GLES2
++            glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
++            glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
++            glBindTexture(GL_TEXTURE_2D, 0);
++            glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, fb.clrbuf, 0);
++#else
+             if (msaa_level <= 1) {
+                 glBindTexture(GL_TEXTURE_2D, fb.clrbuf);
+                 glTexImage2D(GL_TEXTURE_2D, 0, GL_RGB8, width, height, 0, GL_RGB, GL_UNSIGNED_BYTE, NULL);
+@@ -1028,24 +1116,40 @@ void GfxRenderingAPIOGL::UpdateFramebufferParameters(int fb_id, uint32_t width,
+                 glBindRenderbuffer(GL_RENDERBUFFER, 0);
+                 glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, fb.clrbufMsaa);
+             }
++#endif
+         }
+ 
+         if (has_depth_buffer &&
+             (fb.width != width || fb.height != height || fb.msaa_level != msaa_level || !fb.has_depth_buffer)) {
+             glBindRenderbuffer(GL_RENDERBUFFER, fb.rbo);
++#ifdef USE_GLES2
++            glRenderbufferStorage(GL_RENDERBUFFER, mDepthFormat, width, height);
++#else
+             if (msaa_level <= 1) {
+                 glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH24_STENCIL8, width, height);
+             } else {
+                 glRenderbufferStorageMultisample(GL_RENDERBUFFER, msaa_level, GL_DEPTH24_STENCIL8, width, height);
+             }
++#endif
+             glBindRenderbuffer(GL_RENDERBUFFER, 0);
+         }
+ 
++#ifdef USE_GLES2
++        // No GL_DEPTH_STENCIL_ATTACHMENT on GLES2: a packed buffer goes on both points
++        if (fb.has_depth_buffer != has_depth_buffer) {
++            const GLuint rb = has_depth_buffer ? fb.rbo : 0;
++            glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, rb);
++            if (mDepthFormat == GL_DEPTH24_STENCIL8_OES) {
++                glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_STENCIL_ATTACHMENT, GL_RENDERBUFFER, rb);
++            }
++        }
++#else
+         if (!fb.has_depth_buffer && has_depth_buffer) {
+             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, fb.rbo);
+         } else if (fb.has_depth_buffer && !has_depth_buffer) {
+             glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_STENCIL_ATTACHMENT, GL_RENDERBUFFER, 0);
+         }
++#endif
+     }
+ 
+     fb.width = width;
+@@ -1100,6 +1204,10 @@ void GfxRenderingAPIOGL::ClearDepthRegion(int x, int y, int w, int h) {
+ }
+ 
+ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_source) {
++#ifdef USE_GLES2
++    // No MSAA on GLES2, so nothing to resolve
++    return;
++#else
+     FramebufferOGL& fb_dst = mFrameBuffers[fb_id_target];
+     FramebufferOGL& fb_src = mFrameBuffers[fb_id_source];
+     glBindFramebuffer(GL_DRAW_FRAMEBUFFER, fb_dst.fbo);
+@@ -1119,8 +1227,92 @@ void GfxRenderingAPIOGL::ResolveMSAAColorBuffer(int fb_id_target, int fb_id_sour
+         mLastScissorEnabled = 1;
+         glEnable(GL_SCISSOR_TEST);
+     }
++#endif
+ }
+ 
++#ifdef USE_GLES2
++// GLES2 has no glBlitFramebuffer: copy by drawing the source texture as a quad
++void GfxRenderingAPIOGL::DrawTextureToFramebuffer(GLuint tex, int texW, int texH, int srcX0, int srcY0, int srcX1,
++                                                  int srcY1, const FramebufferOGL& dst, int dstX0, int dstY0,
++                                                  int dstX1, int dstY1) {
++    if (mBlitProgram == 0) {
++        static const char* vs = "#version 100\n"
++                                "attribute vec2 aPos;\n"
++                                "attribute vec2 aUv;\n"
++                                "varying vec2 vUv;\n"
++                                "void main() { vUv = aUv; gl_Position = vec4(aPos, 0.0, 1.0); }\n";
++        static const char* fs = "#version 100\n"
++                                "precision mediump float;\n"
++                                "uniform sampler2D uTex;\n"
++                                "varying vec2 vUv;\n"
++                                "void main() { gl_FragColor = texture2D(uTex, vUv); }\n";
++        GLuint v = glCreateShader(GL_VERTEX_SHADER);
++        glShaderSource(v, 1, &vs, nullptr);
++        glCompileShader(v);
++        GLuint f = glCreateShader(GL_FRAGMENT_SHADER);
++        glShaderSource(f, 1, &fs, nullptr);
++        glCompileShader(f);
++        mBlitProgram = glCreateProgram();
++        glAttachShader(mBlitProgram, v);
++        glAttachShader(mBlitProgram, f);
++        glLinkProgram(mBlitProgram);
++        glDeleteShader(v);
++        glDeleteShader(f);
++        mBlitPosLocation = glGetAttribLocation(mBlitProgram, "aPos");
++        mBlitUvLocation = glGetAttribLocation(mBlitProgram, "aUv");
++    }
++
++    const float u0 = (float)srcX0 / texW, u1 = (float)srcX1 / texW;
++    const float v0 = (float)srcY0 / texH, v1 = (float)srcY1 / texH;
++    const float x0 = 2.0f * dstX0 / dst.width - 1.0f, x1 = 2.0f * dstX1 / dst.width - 1.0f;
++    const float y0 = 2.0f * dstY0 / dst.height - 1.0f, y1 = 2.0f * dstY1 / dst.height - 1.0f;
++    const float quad[] = { x0, y0, u0, v0, x1, y0, u1, v0, x0, y1, u0, v1, x1, y1, u1, v1 };
++
++    GLint viewport[4];
++    glGetIntegerv(GL_VIEWPORT, viewport);
++    const GLboolean depthTest = glIsEnabled(GL_DEPTH_TEST);
++    const GLboolean blend = glIsEnabled(GL_BLEND);
++    const GLboolean polygonOffset = glIsEnabled(GL_POLYGON_OFFSET_FILL);
++    ShaderProgram* prg = mLastLoadedShader;
++    UnloadShader(prg);
++
++    glBindFramebuffer(GL_FRAMEBUFFER, dst.fbo);
++    glViewport(0, 0, dst.width, dst.height);
++    glDisable(GL_DEPTH_TEST);
++    glDisable(GL_BLEND);
++    glDisable(GL_POLYGON_OFFSET_FILL);
++    glActiveTexture(GL_TEXTURE0);
++    glBindTexture(GL_TEXTURE_2D, tex);
++    glUseProgram(mBlitProgram);
++    glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STREAM_DRAW);
++    glEnableVertexAttribArray(mBlitPosLocation);
++    glVertexAttribPointer(mBlitPosLocation, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)0);
++    glEnableVertexAttribArray(mBlitUvLocation);
++    glVertexAttribPointer(mBlitUvLocation, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), (void*)(2 * sizeof(float)));
++    glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
++    glDisableVertexAttribArray(mBlitPosLocation);
++    glDisableVertexAttribArray(mBlitUvLocation);
++
++    glBindTexture(GL_TEXTURE_2D, mLastBoundTextures[0]);
++    mLastActiveTexture = 0;
++    glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++    if (depthTest) {
++        glEnable(GL_DEPTH_TEST);
++    }
++    if (blend) {
++        glEnable(GL_BLEND);
++    }
++    if (polygonOffset) {
++        glEnable(GL_POLYGON_OFFSET_FILL);
++    }
++    if (prg != nullptr) {
++        LoadShader(prg);
++    } else {
++        glUseProgram(0);
++    }
++}
++#endif
++
+ void* GfxRenderingAPIOGL::GetFramebufferTextureId(int fb_id) {
+     return (void*)(uintptr_t)mFrameBuffers[fb_id].clrbuf;
+ }
+@@ -1165,6 +1357,35 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
+         glDisable(GL_SCISSOR_TEST);
+     }
+ 
++#ifdef USE_GLES2
++    GLuint tex = src.clrbuf;
++    int texW = src.width, texH = src.height;
++    if (fb_src_id == 0) {
++        // The window has no texture to draw from: copy the region into one first
++        const int x = std::min(srcX0, srcX1), y = std::min(srcY0, srcY1);
++        texW = std::abs(srcX1 - srcX0);
++        texH = std::abs(srcY1 - srcY0);
++        if (mBlitTmpTexture == 0) {
++            glGenTextures(1, &mBlitTmpTexture);
++            glBindTexture(GL_TEXTURE_2D, mBlitTmpTexture);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
++            glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
++        }
++        glBindFramebuffer(GL_FRAMEBUFFER, 0);
++        glActiveTexture(GL_TEXTURE0);
++        glBindTexture(GL_TEXTURE_2D, mBlitTmpTexture);
++        glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, x, y, texW, texH, 0);
++        tex = mBlitTmpTexture;
++        srcX0 -= x;
++        srcX1 -= x;
++        srcY0 -= y;
++        srcY1 -= y;
++    }
++    DrawTextureToFramebuffer(tex, texW, texH, srcX0, srcY0, srcX1, srcY1, dst, dstX0, dstY0, dstX1, dstY1);
++    glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
++#else
+     // For msaa enabled buffers we can't perform a scaled blit to a simple sample buffer
+     // First do an unscaled blit to a msaa resolved buffer
+     if (src.height != dst.height && src.width != dst.width && src.msaa_level > 1) {
+@@ -1203,6 +1424,7 @@ void GfxRenderingAPIOGL::CopyFramebuffer(int fb_dst_id, int fb_src_id, int srcX0
+     glBindFramebuffer(GL_FRAMEBUFFER, mFrameBuffers[mCurrentFrameBuffer].fbo);
+ 
+     glReadBuffer(GL_BACK);
++#endif
+ 
+     if (mLastScissorEnabled != 1) {
+         mLastScissorEnabled = 1;
+@@ -1239,6 +1461,13 @@ std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff>
+ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, float>>& coordinates) {
+     std::unordered_map<std::pair<float, float>, uint16_t, hash_pair_ff> res;
+ 
++#ifdef USE_GLES2
++    // No depth readback on GLES2: report the cleared value, so nothing counts as hidden
++    for (const auto& coord : coordinates) {
++        res.emplace(coord, 0xFFFC);
++    }
++    return res;
++#else
+     FramebufferOGL& fb = mFrameBuffers[fb_id];
+ 
+     // When looking up one value and the framebuffer is single-sampled, we can read pixels directly
+@@ -1302,6 +1531,7 @@ GfxRenderingAPIOGL::GetPixelDepth(int fb_id, const std::set<std::pair<float, flo
+     glBindFramebuffer(GL_FRAMEBUFFER, mCurrentFrameBuffer);
+ 
+     return res;
++#endif
+ }
+ 
+ void GfxRenderingAPIOGL::SetTextureFilter(FilteringMode mode) {
+diff --git a/src/fast/backends/gfx_sdl2.cpp b/src/fast/backends/gfx_sdl2.cpp
+index 9d6a4e75..5a75c4a6 100644
+--- a/src/fast/backends/gfx_sdl2.cpp
++++ b/src/fast/backends/gfx_sdl2.cpp
+@@ -375,6 +375,10 @@ void GfxWindowBackendSDL2::Init(const char* gameName, const char* gfxApiName, bo
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 4);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 1);
++#elif defined(USE_GLES2)
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 2);
++    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+ #elif defined(USE_OPENGLES)
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
+     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+diff --git a/src/fast/shaders/opengl/gles2.shader.glsl b/src/fast/shaders/opengl/gles2.shader.glsl
+new file mode 100644
+index 00000000..27e611b3
+--- /dev/null
++++ b/src/fast/shaders/opengl/gles2.shader.glsl
+@@ -0,0 +1,420 @@
++@prism(type='fragment', name='Fast3D GLES2 Shader', version='1.0.0', description='default.shader.glsl and its includes for GLSL ES 1.00 (Mali-400 / lima)', author='Emill, Prism Team, FakeR36S')
++
++@{GLSL_VERSION}
++
++@if(VERTEX_SHADER)
++    attribute vec4 aVtxPos;
++    attribute float aMtxSlot;
++    @{update_floats(1)}
++
++    // Matrix palette: 4 vec4 rows per slot; clip = obj.x*r0 + obj.y*r1 + obj.z*r2 + obj.w*r3
++    uniform vec4 uMtxPalette[32];
++    uniform vec4 uYScale;
++
++    @for(i in 0..2)
++        @if(o_textures[i])
++            attribute vec2 aTexCoord@{i};
++            varying vec2 vTexCoord@{i};
++            @{update_floats(2)}
++        @end
++    @end
++
++    @if(o_textures[0] || o_textures[1])
++        uniform vec4 uUvTransform[2];
++    @end
++
++    @if(o_fog)
++        varying float vFogFactor;
++        uniform vec4 uFogParams;
++    @end
++
++    @if(o_shade || o_lighting)
++        @if(o_alpha)
++            attribute vec4 aShade;
++            @{update_floats(4)}
++        @else
++            attribute vec3 aShade;
++            @{update_floats(3)}
++        @end
++    @end
++    @if(o_shade)
++        @if(o_alpha)
++            varying vec4 vShade;
++        @else
++            varying vec3 vShade;
++        @end
++    @end
++
++    @if(o_lighting)
++        uniform vec4 uAmbient;
++        uniform int uNumLights;
++        uniform vec4 uLights[96];
++        @if(o_point_lighting)
++            uniform vec4 uMvRows[3];
++            uniform vec4 uMvCols[3];
++        @end
++    @end
++    @if(o_texgen)
++        uniform vec4 uLookatX;
++        uniform vec4 uLookatY;
++        @if(o_textures[0])
++            uniform vec4 uTexgen0;
++        @end
++        @if(o_textures[1])
++            uniform vec4 uTexgen1;
++        @end
++    @end
++
++    void main() {
++        // RSP position transform: matrix palette entry selected per vertex
++        int mtxBase = int(aMtxSlot + 0.5) * 4;
++        vec4 clipPos = aVtxPos.x * uMtxPalette[mtxBase] + aVtxPos.y * uMtxPalette[mtxBase + 1] +
++                       aVtxPos.z * uMtxPalette[mtxBase + 2] + aVtxPos.w * uMtxPalette[mtxBase + 3];
++
++        @for(i in 0..2)
++            @if(o_textures[i])
++                vTexCoord@{i} = vec2(aTexCoord@{i}.x * uUvTransform[@{i}].x + uUvTransform[@{i}].y,
++                                     aTexCoord@{i}.y * uUvTransform[@{i}].z + uUvTransform[@{i}].w);
++            @end
++        @end
++        @if(o_fog)
++            float fogW = abs(clipPos.w) < 0.001 ? 0.001 : clipPos.w;
++            float fogWinv = 1.0 / fogW;
++            if (fogWinv < 0.0) {
++                fogWinv = 32767.0;
++            }
++            float fogCalc = clamp(clipPos.z * fogWinv * uFogParams.x + uFogParams.y, 0.0, 255.0) / 255.0;
++            @if(o_shade && o_alpha)
++                vFogFactor = uFogParams.w > 1.5 ? aShade.a : (uFogParams.w > 0.5 ? uFogParams.z : fogCalc);
++            @else
++                vFogFactor = uFogParams.w > 0.5 ? uFogParams.z : fogCalc;
++            @end
++        @end
++        @if(o_texgen)
++            float texgenDotX = clamp(dot(aShade.xyz, uLookatX.xyz) / 127.0, -1.0, 1.0);
++            float texgenDotY = clamp(dot(aShade.xyz, uLookatY.xyz) / 127.0, -1.0, 1.0);
++            @if(o_texgen_linear)
++                texgenDotX = acos(-texgenDotX) * 0.159155;
++                texgenDotY = acos(-texgenDotY) * 0.159155;
++            @else
++                texgenDotX = (texgenDotX + 1.0) / 4.0;
++                texgenDotY = (texgenDotY + 1.0) / 4.0;
++            @end
++            @if(o_textures[0])
++                vTexCoord0 = vec2(texgenDotX * uTexgen0.x + uTexgen0.y, texgenDotY * uTexgen0.z + uTexgen0.w);
++            @end
++            @if(o_textures[1])
++                vTexCoord1 = vec2(texgenDotX * uTexgen1.x + uTexgen1.y, texgenDotY * uTexgen1.z + uTexgen1.w);
++            @end
++        @end
++        @if(o_shade && o_alpha)
++            float shadeAlpha = aShade.a;
++            @if(o_fog)
++                if (uFogParams.w < 0.5 || uFogParams.w > 1.5) {
++                    shadeAlpha = 1.0;
++                }
++            @end
++        @end
++        @if(o_point_lighting)
++            vec3 worldPos = vec3(dot(aVtxPos, uMvCols[0]), dot(aVtxPos, uMvCols[1]), dot(aVtxPos, uMvCols[2]));
++        @end
++        @if(o_shade)
++            @if(o_lighting)
++                // N64 RSP lighting: aShade carries the raw signed vertex normal. GLSL ES 1.00 (and lima's
++                // vertex compiler) wants a loop it can unroll: a constant bound, the light count as a test.
++                vec3 litColor = uAmbient.rgb;
++                for (int i = 0; i < 7; i++) {
++                    if (i < uNumLights) {
++                        float intensity = 0.0;
++                        @if(o_point_lighting)
++                        if (uLights[i * 3].w > 0.5) {
++                            vec3 distVec = uLights[i * 3 + 2].xyz - worldPos;
++                            float distSq = distVec.x * distVec.x + distVec.y * distVec.y + distVec.z * distVec.z * 2.0;
++                            float dist = sqrt(distSq);
++                            vec3 lightModel = vec3(dot(distVec, uMvRows[0].xyz), dot(distVec, uMvRows[1].xyz), dot(distVec, uMvRows[2].xyz));
++                            vec3 lightIntensity = clamp(4.0 * lightModel / distSq, -1.0, 1.0);
++                            float totalIntensity = clamp(dot(lightIntensity, aShade.xyz), -1.0, 1.0);
++                            float distF = floor(dist);
++                            float attenuation = (distF * uLights[i * 3 + 1].w * 2.0 + distF * distF * uLights[i * 3 + 2].w / 8.0) / 65535.0 + 1.0;
++                            intensity = totalIntensity / attenuation;
++                        } else {
++                            intensity = dot(aShade.xyz, uLights[i * 3 + 1].xyz) / 127.0;
++                        }
++                        @else
++                        intensity = dot(aShade.xyz, uLights[i * 3 + 1].xyz) / 127.0;
++                        @end
++                        if (intensity > 0.0) {
++                            litColor += intensity * uLights[i * 3].rgb;
++                        }
++                    }
++                }
++                litColor = min(litColor, vec3(1.0));
++                @if(o_alpha)
++                    vShade = vec4(litColor, shadeAlpha);
++                @else
++                    vShade = litColor;
++                @end
++            @else
++                @if(o_alpha)
++                    vShade = vec4(aShade.rgb, shadeAlpha);
++                @else
++                    vShade = aShade;
++                @end
++            @end
++        @end
++        gl_Position = vec4(clipPos.x, clipPos.y * uYScale.x, clipPos.z, clipPos.w);
++        gl_Position.z *= 0.3;
++    }
++
++@else
++    // GLSL ES 1.00 for the Mali-400: mediump only, no integer or bit operations, no array
++    // constructors, no textureSize/textureLod, no gl_FragDepth. Mip chains are not uploaded on GLES2
++    // (gfx_opengl.cpp), so the N64 LOD math reduces to its base level; the RDP dither is left out.
++    @for(i in 0..2)
++        @if(o_textures[i])
++            varying vec2 vTexCoord@{i};
++        @end
++    @end
++
++    @if(o_textures[0] || o_textures[1])
++        uniform vec4 uTexClamp[2];
++    @end
++
++    @if(o_fog)
++        varying float vFogFactor;
++    @end
++
++    @if(o_shade)
++        @if(o_alpha)
++            varying vec4 vShade;
++        @else
++            varying vec3 vShade;
++        @end
++    @end
++
++    @if(o_has_inputs)
++        uniform vec4 uInputs[@{o_inputs}];
++    @end
++    @if(o_fog)
++        uniform vec4 uFogColor;
++    @end
++    @if(o_grayscale)
++        uniform vec4 uGrayscaleColor;
++    @end
++
++    @if(o_textures[0])
++        uniform sampler2D uTex0;
++    @end
++    @if(o_textures[1])
++        uniform sampler2D uTex1;
++    @end
++    @if(o_masks[0])
++        uniform sampler2D uTexMask0;
++    @end
++    @if(o_masks[1])
++        uniform sampler2D uTexMask1;
++    @end
++    @if(o_blend[0])
++        uniform sampler2D uTexBlend0;
++    @end
++    @if(o_blend[1])
++        uniform sampler2D uTexBlend1;
++    @end
++
++    uniform int frame_count;
++    uniform float noise_scale;
++
++    uniform int texture_width[2];
++    uniform int texture_height[2];
++    uniform int texture_filtering[2];
++
++    #define TEX_OFFSET(off) texture2D(tex, texCoord - off / texSize)
++    #define WRAP(x, low, high) mod((x)-(low), (high)-(low)) + (low)
++
++    float random(in vec3 value) {
++        float random = dot(sin(value), vec3(12.9898, 78.233, 37.719));
++        return fract(sin(random) * 143758.5453);
++    }
++
++    @if(o_three_point_filtering)
++    vec4 filter3point(in sampler2D tex, in vec2 texCoord, in vec2 texSize) {
++        vec2 offset = fract(texCoord*texSize - vec2(0.5));
++        offset -= step(1.0, offset.x + offset.y);
++        vec4 c0 = TEX_OFFSET(offset);
++        vec4 c1 = TEX_OFFSET(vec2(offset.x - sign(offset.x), offset.y));
++        vec4 c2 = TEX_OFFSET(vec2(offset.x, offset.y - sign(offset.y)));
++        return c0 + abs(offset.x)*(c1-c0) + abs(offset.y)*(c2-c0);
++    }
++    @end
++
++    @if(o_palette[0] || o_palette[1])
++        uniform sampler2D uTexPal;
++        uniform vec4 uPaletteParams[2];
++
++        // One CI tap: the index (nearest sampler), looked up in the 256-entry palette texture
++        vec4 paletteTap(in sampler2D tex, in vec2 uv, in float bank) {
++            float idx = texture2D(tex, uv).r;
++            return texture2D(uTexPal, vec2((idx * 255.0 + bank + 0.5) / 256.0, 0.5));
++        }
++
++        // Filtering after the palette lookup, like the hardware: params.y nearest (0), bilinear (1),
++        // three-point (2)
++        vec4 paletteSample(in sampler2D tex, in vec2 uv, in vec2 texSize, in vec4 params) {
++            if (params.y > 1.5) {
++                vec2 offset = fract(uv * texSize - vec2(0.5));
++                offset -= step(1.0, offset.x + offset.y);
++                vec4 c0 = paletteTap(tex, uv - offset / texSize, params.x);
++                vec4 c1 = paletteTap(tex, uv - vec2(offset.x - sign(offset.x), offset.y) / texSize, params.x);
++                vec4 c2 = paletteTap(tex, uv - vec2(offset.x, offset.y - sign(offset.y)) / texSize, params.x);
++                return c0 + abs(offset.x) * (c1 - c0) + abs(offset.y) * (c2 - c0);
++            } else if (params.y > 0.5) {
++                vec2 t = uv * texSize - 0.5;
++                vec2 f = fract(t);
++                vec2 base = (floor(t) + 0.5) / texSize;
++                vec2 px = vec2(1.0, 0.0) / texSize;
++                vec2 py = vec2(0.0, 1.0) / texSize;
++                vec4 c00 = paletteTap(tex, base, params.x);
++                vec4 c10 = paletteTap(tex, base + px, params.x);
++                vec4 c01 = paletteTap(tex, base + py, params.x);
++                vec4 c11 = paletteTap(tex, base + px + py, params.x);
++                return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
++            } else {
++                return paletteTap(tex, uv, params.x);
++            }
++        }
++    @end
++
++    void main() {
++        @if(o_uses_lod)
++            // No derivatives or explicit LOD on GLES2: the base level, no blend between tiles
++            float lodFrac = 0.0;
++        @end
++        @for(i in 0..2)
++            @if(o_textures[i])
++                @{s = o_clamp[i][0]}
++                @{t = o_clamp[i][1]}
++
++                vec2 texSize@{i} = vec2(float(texture_width[@{i}]), float(texture_height[@{i}]));
++
++                @if(!s && !t)
++                    vec2 vTexCoordAdj@{i} = vTexCoord@{i};
++                @else
++                    @if(s && t)
++                        vec2 vTexCoordAdj@{i} = clamp(vTexCoord@{i}, 0.5 / texSize@{i}, uTexClamp[@{i}].xy);
++                    @elseif(s)
++                        vec2 vTexCoordAdj@{i} = vec2(clamp(vTexCoord@{i}.s, 0.5 / texSize@{i}.s, uTexClamp[@{i}].x), vTexCoord@{i}.t);
++                    @else
++                        vec2 vTexCoordAdj@{i} = vec2(vTexCoord@{i}.s, clamp(vTexCoord@{i}.t, 0.5 / texSize@{i}.t, uTexClamp[@{i}].y));
++                    @end
++                @end
++
++                @if(i == 0 && o_mip_lod)
++                    vec4 texVal0 = texture2D(uTex0, vTexCoordAdj0);
++                @elseif(o_palette[i])
++                    vec4 texVal@{i} = paletteSample(uTex@{i}, vTexCoordAdj@{i}, texSize@{i}, uPaletteParams[@{i}]);
++                @else
++                    @if(o_three_point_filtering)
++                    vec4 texVal@{i} = texture_filtering[@{i}] == @{FILTER_THREE_POINT} ?
++                        filter3point(uTex@{i}, vTexCoordAdj@{i}, texSize@{i}) : texture2D(uTex@{i}, vTexCoordAdj@{i});
++                    @else
++                    vec4 texVal@{i} = texture2D(uTex@{i}, vTexCoordAdj@{i});
++                    @end
++                @end
++
++                @if(o_masks[i])
++                    vec4 maskVal@{i} = texture2D(uTexMask@{i}, vTexCoordAdj@{i});
++                    @if(o_blend[i])
++                        vec4 blendVal@{i} = texture2D(uTexBlend@{i}, vTexCoordAdj@{i});
++                    @else
++                        vec4 blendVal@{i} = vec4(0.0, 0.0, 0.0, 0.0);
++                    @end
++                    texVal@{i} = mix(texVal@{i}, blendVal@{i}, maskVal@{i}.a);
++                @end
++            @end
++        @end
++
++        @if(o_mip_lod)
++            // TEXEL1 reads the next mip level of texture 0: the same level here
++            vec4 texVal1 = texVal0;
++        @end
++
++        @if(o_alpha)
++            vec4 texel;
++        @else
++            vec3 texel;
++        @end
++
++        @if(o_2cyc)
++            @{f_range = 2}
++        @else
++            @{f_range = 1}
++        @end
++
++        @for(c in 0..f_range)
++            @if(c == 1)
++                @if(o_alpha)
++                    @if(o_c[c][1][2] == SHADER_COMBINED)
++                        texel.a = WRAP(texel.a, -1.01, 1.01);
++                    @else
++                        texel.a = WRAP(texel.a, -0.51, 1.51);
++                    @end
++                @end
++
++                @if(o_c[c][0][2] == SHADER_COMBINED)
++                    texel.rgb = WRAP(texel.rgb, -1.01, 1.01);
++                @else
++                    texel.rgb = WRAP(texel.rgb, -0.51, 1.51);
++                @end
++            @end
++
++            @if(!o_color_alpha_same[c] && o_alpha)
++                texel = vec4(@{
++                append_formula(o_c[c], o_do_single[c][0],
++                            o_do_multiply[c][0], o_do_mix[c][0], false, false, true, c == 0)
++                }, @{append_formula(o_c[c], o_do_single[c][1],
++                            o_do_multiply[c][1], o_do_mix[c][1], true, true, true, c == 0)
++                });
++            @else
++                texel = @{append_formula(o_c[c], o_do_single[c][0],
++                            o_do_multiply[c][0], o_do_mix[c][0], o_alpha, false,
++                            o_alpha, c == 0)};
++            @end
++        @end
++
++        texel = WRAP(texel, -0.51, 1.51);
++        texel = clamp(texel, 0.0, 1.0);
++        @if(o_fog)
++            @if(o_alpha)
++                texel = vec4(mix(texel.rgb, uFogColor.rgb, vFogFactor), texel.a);
++            @else
++                texel = mix(texel, uFogColor.rgb, vFogFactor);
++            @end
++        @end
++
++        @if(o_texture_edge && o_alpha)
++            if (texel.a > 0.19) texel.a = 1.0; else discard;
++        @end
++
++        @if(o_alpha && o_noise)
++            texel.a *= floor(clamp(random(vec3(floor(gl_FragCoord.xy * noise_scale), float(frame_count))) + texel.a, 0.0, 1.0));
++        @end
++
++        @if(o_grayscale)
++            float intensity = (texel.r + texel.g + texel.b) / 3.0;
++            vec3 new_texel = uGrayscaleColor.rgb * intensity;
++            texel.rgb = mix(texel.rgb, new_texel, uGrayscaleColor.a);
++        @end
++
++        @if(o_alpha)
++            @if(o_alpha_threshold)
++                if (texel.a < 8.0 / 256.0) discard;
++            @end
++            @if(o_invisible)
++                texel.a = 0.0;
++            @end
++            gl_FragColor = texel;
++        @else
++            gl_FragColor = vec4(texel, 1.0);
++        @end
++    }
++@end

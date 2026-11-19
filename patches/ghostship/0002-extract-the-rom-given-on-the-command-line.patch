@@ -1,0 +1,86 @@
+diff --git a/src/port/Engine.cpp b/src/port/Engine.cpp
+index 10ae903..2f566ee 100644
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -756,7 +756,9 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+ #elif (defined(__WIIU__) || defined(__SWITCH__))
+                 extractStep = ES_VERIFY;
+ #else
+-                extractStep = ES_EXTRACT;
++                // FakeR36S: a ROM given on the command line (the launcher found it) is extracted without asking,
++                // as on Windows; the console has no file dialog and no mouse to answer the prompts
++                extractStep = args.empty() ? ES_EXTRACT : ES_EXTRACT_ARGS;
+ #endif
+                 /*} else {
+                     std::string msg;
+@@ -879,23 +881,14 @@ void GameEngine::RunExtract(int argc, char* argv[]) {
+             case ES_EXTRACT_ARGS: {
+ #if !defined(__SWITCH__) && !defined(__WIIU__)
+                 if (args.size() == 0) {
+-                    GhostshipGui::RegisterPopup(
+-                        "Run Ghostship", "All files have been processed. Run Ghostship?", "Yes", "No",
+-                        [&]() {
+-                            if (!std::filesystem::exists(Ship::Context::GetAppDirectoryPath("sm64") + "/sm64.o2r")) {
+-                                extractStep = ES_EXTRACT;
+-                                promptStep = PS_FILE_CHECK;
+-                            } else {
+-                                extractStep = ES_VERIFY;
+-                            }
+-                        },
+-                        [&]() {
+-                            threadPool = nullptr;
+-                            gsFast3dWindow = nullptr;
+-                            context = nullptr;
+-                            exit(0);
+-                        });
+-                    break;
++                    // FakeR36S: on to the game once the ROM given is extracted, without asking
++                    if (!std::filesystem::exists(Ship::Context::GetAppDirectoryPath("sm64") + "/sm64.o2r")) {
++                        extractStep = ES_EXTRACT;
++                        promptStep = PS_FILE_CHECK;
++                    } else {
++                        extractStep = ES_VERIFY;
++                    }
++                    continue;
+                 }
+                 file = args.at(0);
+                 args.erase(args.begin());
+diff --git a/src/port/GameExtractor.cpp b/src/port/GameExtractor.cpp
+index 8c94f89..88c7e5d 100644
+--- a/src/port/GameExtractor.cpp
++++ b/src/port/GameExtractor.cpp
+@@ -43,6 +43,26 @@ static std::filesystem::path Utf8ToFsPath(const std::string& utf8) {
+     return std::filesystem::path(reinterpret_cast<const char8_t*>(utf8.c_str()));
+ }
+ 
++// FakeR36S: .v64 (byte-swapped) and .n64 (little-endian) dumps of the same ROM become the .z64 (big-endian) the
++// checksums and Torch expect
++static void NormalizeByteOrder(std::vector<uint8_t>& data) {
++    if (data.size() < 4 || data.size() % 4 != 0) {
++        return;
++    }
++    if (data[0] == 0x37 && data[1] == 0x80 && data[2] == 0x40 && data[3] == 0x12) {
++        for (size_t i = 0; i + 1 < data.size(); i += 2) {
++            std::swap(data[i], data[i + 1]);
++        }
++        SPDLOG_INFO("ROM is byte-swapped (.v64): converted to .z64 order");
++    } else if (data[0] == 0x40 && data[1] == 0x12 && data[2] == 0x37 && data[3] == 0x80) {
++        for (size_t i = 0; i + 3 < data.size(); i += 4) {
++            std::swap(data[i], data[i + 3]);
++            std::swap(data[i + 1], data[i + 2]);
++        }
++        SPDLOG_INFO("ROM is little-endian (.n64): converted to .z64 order");
++    }
++}
++
+ bool GameExtractor::RunStandalone(std::string rom) {
+     // Store both path and already-read data
+     std::string romPath;
+@@ -69,6 +89,7 @@ bool GameExtractor::RunStandalone(std::string rom) {
+     }
+ 
+     inFile.close();
++    NormalizeByteOrder(data);
+     std::string hash = Companion::CalculateHash(data);
+ 
+     if (mGameList.find(hash) != mGameList.end()) {

@@ -1,0 +1,18 @@
+diff --git a/src/fast/interpreter.cpp b/src/fast/interpreter.cpp
+index b6dd2ae6..c66b5098 100644
+--- a/src/fast/interpreter.cpp
++++ b/src/fast/interpreter.cpp
+@@ -5370,6 +5370,13 @@ bool gfx_set_timg_handler_rdp(F3DGfx** cmd0) {
+                              reinterpret_cast<LPCSTR>(i), &module))) {
+         return false;
+     }
++#elif UINTPTR_MAX <= 0xFFFFFFFFu
++    // A 32-bit program (non-PIE, its heap right after it) lives below 0x10000000 too, so the range
++    // proves nothing there. An unresolved segmented address is still odd (SEG_ADDR sets bit 0):
++    // reject only those.
++    if (rawTexMetdata.resource == nullptr && (i < 0x10000 || (i & 1) != 0)) {
++        return false;
++    }
+ #elif !defined(__EMSCRIPTEN__)
+     if (rawTexMetdata.resource == nullptr && i <= 0x0FFFFFFF) {
+         return false;

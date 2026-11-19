@@ -1,0 +1,9 @@
+# Super Mario 64 for FakeR36S-OS (github.com/Eeman1113/FakeR36S-SM64); build.sh fills in the version. Its first
+# start makes the game's assets from the player's own ROM, found in HOME.
+[ENTRY]
+CATEGORY=Ports
+NAME=Super Mario 64
+DESCRIPTION=Ghostship, from your own ROM: put it in HOME and open this
+COMMAND=/home/player/ports/sm64/run.sh
+ICON=/home/player/.local/share/icons/sm64.png
+VERSION=@VERSION@

@@ -1,0 +1,53 @@
+diff --git a/src/port/Engine.cpp b/src/port/Engine.cpp
+index 10ae903..e2b6a0f 100644
+--- a/src/port/Engine.cpp
++++ b/src/port/Engine.cpp
+@@ -546,7 +546,8 @@ void GameEngine::FinishInit() {
+     SetupScriptLoader(context);
+ 
+     auto audio = std::make_shared<Ship::Audio>(
+-        Ship::AudioSettings{ .SampleRate = 32000, .SampleLength = 512, .DesiredBuffered = 1100 },
++        // FakeR36S: 100 ms queued, so one slow frame on the A23 (a shader compiling) doesn't empty it
++        Ship::AudioSettings{ .SampleRate = 32000, .SampleLength = 512, .DesiredBuffered = 3200 },
+         ShipCompat::GetConfig());
+     context->GetChildren().Add(audio);
+     AudioSetAudioComponent(audio);
+@@ -1530,20 +1531,32 @@ void GameEngine::HandleAudioThread() {
+         int samples_left = AudioPlayerBuffered();
+         u32 num_audio_samples = samples_left < AudioPlayerGetDesiredBuffered() ? SAMPLES_HIGH : SAMPLES_LOW;
+ 
+-        s16 audio_buffer[SAMPLES_PER_FRAME];
+-        for (int i = 0; i < NUM_AUDIO_CHANNELS; i++) {
++        // FakeR36S: a late game frame would starve the queue: make what it is missing, so the music keeps its
++        // tempo (the N64's audio had its own clock too). Two audio frames per game frame otherwise, as before.
++#define FR_MAX_AUDIO_FRAMES 6
++        int frames = 2;
++        const int missing = AudioPlayerGetDesiredBuffered() - samples_left;
++        if (missing > (int)(num_audio_samples * frames)) {
++            frames = std::min(FR_MAX_AUDIO_FRAMES, (int)((missing + num_audio_samples - 1) / num_audio_samples));
++        }
++
++        s16 audio_buffer[SAMPLES_HIGH * NUM_AUDIO_CHANNELS * FR_MAX_AUDIO_FRAMES];
++        for (int i = 0; i < frames; i++) {
+             create_next_audio_buffer(audio_buffer + i * (num_audio_samples * 2), num_audio_samples);
+         }
+ 
+         float master_vol = CVarGetInteger("gSettings.Volume.Master", 100) / 100.0f;
+ 
+-        for (u32 i = 0; i < SAMPLES_PER_FRAME; i++) {
+-            audio_buffer[i] = static_cast<s16>(audio_buffer[i] * master_vol);
++        const u32 total = (u32)frames * num_audio_samples * NUM_AUDIO_CHANNELS;
++        if (master_vol < 0.999f) {
++            for (u32 i = 0; i < total; i++) {
++                audio_buffer[i] = static_cast<s16>(audio_buffer[i] * master_vol);
++            }
+         }
+ 
+-        ModAudio_MixInto(audio_buffer, num_audio_samples * 2);
++        ModAudio_MixInto(audio_buffer, num_audio_samples * frames);
+ 
+-        AudioPlayerPlayFrame((u8*)audio_buffer, 2 * num_audio_samples * 4);
++        AudioPlayerPlayFrame((u8*)audio_buffer, total * sizeof(s16));
+ 
+         audio.processing = false;
+         audio.cv_from_thread.notify_one();

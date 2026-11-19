@@ -1,0 +1,50 @@
+diff --git a/src/ship/resource/ResourceManager.cpp b/src/ship/resource/ResourceManager.cpp
+index d02807e1..cc5d2780 100644
+--- a/src/ship/resource/ResourceManager.cpp
++++ b/src/ship/resource/ResourceManager.cpp
+@@ -12,6 +12,26 @@
+ #include "ship/security/Keystore.h"
+ #include "ship/thread/ThreadPool.h"
+ 
++// FakeR36S: lets the game record which memory each asset is built in (persistent save states).
++// Weak, so builds without the hook (2 Ship 2 Harkinian) link unchanged.
++extern "C" void FrTrack_Push(const char* path) __attribute__((weak));
++extern "C" void FrTrack_Pop(void) __attribute__((weak));
++namespace {
++struct FrTrackScope {
++    bool open;
++    explicit FrTrackScope(const std::string& path) : open(FrTrack_Push != nullptr) {
++        if (open) FrTrack_Push(path.c_str());
++    }
++    void Close() {
++        if (open && FrTrack_Pop != nullptr) FrTrack_Pop();
++        open = false;
++    }
++    ~FrTrackScope() {
++        Close();
++    }
++};
++} // namespace
++
+ namespace Ship {
+ 
+ ResourceFilter::ResourceFilter(const std::list<std::string>& includeMasks, const std::list<std::string>& excludeMasks,
+@@ -155,8 +175,10 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
+     }
+ 
+     // Get the file from the OTR
++    FrTrackScope frTrack(identifier.Path);
+     auto file = LoadFileProcess(identifier.Path);
+     if (file == nullptr) {
++        frTrack.Close();   // a miss (an alt asset that isn't there) builds nothing: don't record the cache entry
+         SPDLOG_TRACE("Failed to load resource file at path {}", identifier.Path);
+         mResourceCache[identifier] = ResourceLoadError::NotFound;
+         return nullptr;
+@@ -164,6 +186,7 @@ std::shared_ptr<IResource> ResourceManager::LoadResourceProcess(const ResourceId
+ 
+     // Transform the raw data into a resource
+     auto resource = GetResourceLoader()->LoadResource(identifier.Path, file, initData);
++    frTrack.Close();
+ 
+     // Another thread could have loaded the resource while we were processing, so we want to check before setting to
+     // the cache.

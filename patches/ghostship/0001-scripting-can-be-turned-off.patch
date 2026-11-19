@@ -1,0 +1,14 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1f4c038..cc952d1 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -524,7 +524,8 @@ elseif(EMSCRIPTEN)
+     # zip.h/zipconf.h for libultraship headers included by game code.
+     target_include_directories(${PROJECT_NAME} PRIVATE ${libzip_SOURCE_DIR}/lib ${libzip_BINARY_DIR})
+ elseif(NOT CMAKE_SYSTEM_NAME STREQUAL "NintendoSwitch")
+-    set(ENABLE_SCRIPTING ON CACHE BOOL "" FORCE)
++    # FakeR36S: -DENABLE_SCRIPTING=OFF is kept (TinyCC's configure targets the build machine, not armhf)
++    set(ENABLE_SCRIPTING ON CACHE BOOL "")
+ else()
+     #=================== tinyxml2 ===================
+     # devkitPro portlibs may have tinyxml2 headers/lib but no CMake config that
