@@ -1,4 +1,4 @@
-// limacheck <dir> <count>: compiles, links and draws each NNNN.vert / NNNN.frag pair of tools/shadercheck with the
+// limacheck <dir> <count>: compiles and links each NNNN.vert / NNNN.frag pair of tools/shadercheck with the
 // lima (Mali-400) driver, its real shader compiler, under Mesa's drm-shim (no GPU needed: the shim answers lima's
 // ioctls). A "== NNNN" line before each program, so lima's own messages (gpir:, ppir:) say which one they belong to;
 // "FAIL NNNN ..." when GL itself reports a problem. Run with LIMA_DEBUG=shaderdb,precompile.
@@ -112,17 +112,9 @@ int main(int argc, char** argv) {
             glGetProgramInfoLog(p, sizeof(log), NULL, log);
             printf("FAIL %04d link: %s\n", i, log);
             bad = 1;
-        } else {
-            glUseProgram(p);
-            glDrawArrays(GL_TRIANGLES, 0, 3);
-            glFinish();
-            GLenum e = glGetError();
-            if (e != GL_NO_ERROR) {
-                printf("FAIL %04d draw: GL error 0x%x\n", i, e);
-                bad = 1;
-            }
         }
-        glUseProgram(0);
+        // no draw: with LIMA_DEBUG=precompile lima compiles both shaders at link time, and a draw would wait
+        // forever for a fence the noop shim never signals
         glDeleteProgram(p);
         glDeleteShader(v);
         glDeleteShader(f);

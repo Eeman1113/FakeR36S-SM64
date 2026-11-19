@@ -180,7 +180,7 @@ lima() {
     local pid=$!
     while kill -0 $pid 2>/dev/null; do
         sleep 60
-        echo "lima: $(grep -c '^== [0-9]' "$d/lima.log") of $n programs, $(grep -c 'shader:' "$d/lima.log") shader stats"
+        echo "lima: $(grep -c '^== [0-9]' "$d/lima.log") of $n programs, $(grep -c 'SHADER-DB' "$d/lima.log") shaders compiled"
         cp "$d/lima.log" /repo/out/lima/
     done
     wait $pid || echo "limacheck ended with $?"
@@ -203,10 +203,17 @@ bad = []
 stats = 0
 for k, lines in sections.items():
     text = "\n".join(lines)
-    stats += len(re.findall(r"shader:", text))
-    if re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
+    n = len(re.findall(r"SHADER-DB: MESA_SHADER_(VERTEX|FRAGMENT) shader:", text))
+    stats += n
+    # both shaders must have compiled (a stats line each) and lima must not have complained
+    if n < 2 or re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
         bad.append((k, text))
-print(f"== lima: {len(sections)} programs, {stats} shader stats lines, {len(bad)} with errors")
+insts = [int(x) for x in re.findall(r"MESA_SHADER_VERTEX shader: (\d+) inst", "\n".join(log))]
+finsts = [int(x) for x in re.findall(r"MESA_SHADER_FRAGMENT shader: (\d+) inst", "\n".join(log))]
+print(f"== lima: {len(sections)} programs, {stats} shaders compiled, {len(bad)} with errors")
+if insts and finsts:
+    print(f"== vertex instructions: max {max(insts)}, mean {sum(insts) // len(insts)}; "
+          f"fragment: max {max(finsts)}, mean {sum(finsts) // len(finsts)}")
 for k, text in bad[:4]:
     print(f"---- {k}:\n{text[:3000]}")
     for ext in ("vert", "frag"):
