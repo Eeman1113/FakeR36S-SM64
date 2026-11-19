@@ -197,6 +197,8 @@ for line in log:
         cur = m.group(1)
         sections.setdefault(cur, [])
         continue
+    if line.startswith("== ") and "programs," in line:   # limacheck's own summary
+        cur = None
     if cur is not None:
         sections[cur].append(line)
 bad = []
@@ -207,7 +209,8 @@ for k, lines in sections.items():
     # every fragment shader is new and gets compiled (a stats line); a vertex shader whose NIR lima has already
     # compiled comes from its cache, without a line. Nothing may fail or make lima complain.
     if not re.search(r"MESA_SHADER_FRAGMENT shader:", text) or \
-            re.search(r"FAIL|gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
+            re.search(r"^FAIL ", text, re.M) or \
+            re.search(r"gpir:|ppir:|lima:.*(fail|error|unsupported)|not implemented|unsupported", text, re.I):
         bad.append((k, text))
 insts = [int(x) for x in re.findall(r"MESA_SHADER_VERTEX shader: (\d+) inst", "\n".join(log))]
 finsts = [int(x) for x in re.findall(r"MESA_SHADER_FRAGMENT shader: (\d+) inst", "\n".join(log))]
